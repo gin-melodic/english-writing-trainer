@@ -1,0 +1,13 @@
+.next
+node_modules
+out
+.vercel
+tsconfig.tsbuildinfo
+data/*.db
+data/*.db-*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env*.local
+.DS_Store
