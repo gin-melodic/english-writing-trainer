@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { Ability, AbilityHistory, DIMENSIONS, Dimension, Mistake, Settings, TrainingRecord } from "./types";
+import { Ability, AbilityHistory, AssessmentMatrixItem, AssessmentReport, DIMENSIONS, Dimension, GradeResult, Mistake, Question, QuestionAnswerRecord, Settings, TrainingRecord } from "./types";
 
 const DB_PATH = join(process.cwd(), "data", "trainer.db");
 
@@ -60,6 +60,27 @@ CREATE TABLE IF NOT EXISTS sessions (
   started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   ended_at TEXT
 );
+CREATE TABLE IF NOT EXISTS question_answers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  mode TEXT NOT NULL,
+  question_index INTEGER NOT NULL,
+  question_json TEXT NOT NULL,
+  user_answer TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  duration_seconds INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS assessment_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  total_questions INTEGER NOT NULL,
+  matrix_json TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  weak_points_json TEXT NOT NULL,
+  recommendations_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `);
   const settings = getSettings();
   setSettings(settings);
@@ -75,11 +96,12 @@ export function getSettings(): Settings {
     baseUrl: "http://localhost:1234",
     model: "",
     temperature: 0.3,
-    dailyCount: 20
+    dailyCount: 20,
+    maxConcurrentPredictions: 5
   };
   const data = rows<{ key: keyof Settings; value: string }>("SELECT key, value FROM settings;");
   for (const item of data) {
-    if (item.key === "temperature" || item.key === "dailyCount") {
+    if (item.key === "temperature" || item.key === "dailyCount" || item.key === "maxConcurrentPredictions") {
       (defaults[item.key] as number) = Number(item.value);
     } else {
       defaults[item.key] = item.value;
@@ -93,7 +115,8 @@ export function setSettings(settings: Settings) {
     baseUrl: settings.baseUrl || "http://localhost:1234",
     model: settings.model || "",
     temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
-    dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20))
+    dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
+    maxConcurrentPredictions: Math.min(10, Math.max(1, Number(settings.maxConcurrentPredictions) || 5))
   };
   const entries = Object.entries(normalized)
     .map(([key, value]) => `(${sqlQuote(key)}, ${sqlQuote(value)})`)
@@ -119,12 +142,12 @@ INSERT INTO ability_history(date, dimension, score) VALUES (${sqlQuote(today)}, 
 }
 
 export function clearAbilities() {
-  runSql("DELETE FROM abilities; DELETE FROM ability_history;");
+  runSql("DELETE FROM abilities; DELETE FROM ability_history; DELETE FROM assessment_reports;");
 }
 
 export function clearAllData() {
-  runSql("DELETE FROM settings; DELETE FROM abilities; DELETE FROM ability_history; DELETE FROM mistakes; DELETE FROM sessions;");
-  setSettings({ baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20 });
+  runSql("DELETE FROM settings; DELETE FROM abilities; DELETE FROM ability_history; DELETE FROM mistakes; DELETE FROM sessions; DELETE FROM question_answers; DELETE FROM assessment_reports;");
+  setSettings({ baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20, maxConcurrentPredictions: 5 });
 }
 
 export function getHistory(): AbilityHistory[] {
@@ -174,6 +197,86 @@ UPDATE sessions
 SET completed = completed + 1, correct = correct + ${correct ? 1 : 0}
 WHERE id = ${Number(id)};
 `);
+}
+
+export function recordQuestionAnswer(input: {
+  sessionId: number;
+  mode: string;
+  questionIndex: number;
+  question: Question;
+  userAnswer: string;
+  result: GradeResult;
+  durationSeconds?: number;
+}) {
+  runSql(`
+INSERT INTO question_answers(session_id, mode, question_index, question_json, user_answer, result_json, duration_seconds)
+VALUES (${Number(input.sessionId)}, ${sqlQuote(input.mode)}, ${Number(input.questionIndex)}, ${sqlQuote(JSON.stringify(input.question))}, ${sqlQuote(input.userAnswer)}, ${sqlQuote(JSON.stringify(input.result))}, ${Math.max(0, Math.round(input.durationSeconds ?? 0))});
+`);
+}
+
+export function getQuestionAnswers(sessionId: number): QuestionAnswerRecord[] {
+  return rows<Omit<QuestionAnswerRecord, "question" | "result"> & { question_json: string; result_json: string }>(`
+SELECT id, session_id, mode, question_index, question_json, user_answer, result_json, duration_seconds, created_at
+FROM question_answers
+WHERE session_id = ${Number(sessionId)}
+ORDER BY question_index ASC, id ASC;
+`).map((item) => ({
+    id: item.id,
+    session_id: item.session_id,
+    mode: item.mode,
+    question_index: item.question_index,
+    question: JSON.parse(item.question_json) as Question,
+    user_answer: item.user_answer,
+    result: JSON.parse(item.result_json) as GradeResult,
+    duration_seconds: item.duration_seconds,
+    created_at: item.created_at
+  }));
+}
+
+export function addAssessmentReport(input: {
+  sessionId: number;
+  totalQuestions: number;
+  matrix: AssessmentMatrixItem[];
+  summary: string;
+  weakPoints: string[];
+  recommendations: string[];
+}) {
+  runSql(`
+INSERT INTO assessment_reports(session_id, total_questions, matrix_json, summary, weak_points_json, recommendations_json)
+VALUES (${Number(input.sessionId)}, ${Number(input.totalQuestions)}, ${sqlQuote(JSON.stringify(input.matrix))}, ${sqlQuote(input.summary)}, ${sqlQuote(JSON.stringify(input.weakPoints))}, ${sqlQuote(JSON.stringify(input.recommendations))});
+`);
+  const [{ id }] = rows<{ id: number }>("SELECT MAX(id) as id FROM assessment_reports;");
+  return id;
+}
+
+export function getAssessmentReports(limit = 10, offset = 0): AssessmentReport[] {
+  const normalizedLimit = Math.max(1, Math.min(50, Math.round(limit)));
+  const normalizedOffset = Math.max(0, Math.round(offset));
+  return rows<Omit<AssessmentReport, "matrix" | "weak_points" | "recommendations"> & { matrix_json: string; weak_points_json: string; recommendations_json: string }>(`
+SELECT id, session_id, total_questions, matrix_json, summary, weak_points_json, recommendations_json, created_at
+FROM assessment_reports
+ORDER BY created_at DESC, id DESC
+LIMIT ${normalizedLimit} OFFSET ${normalizedOffset};
+`).map((item) => ({
+    id: item.id,
+    session_id: item.session_id,
+    total_questions: item.total_questions,
+    matrix: JSON.parse(item.matrix_json) as AssessmentMatrixItem[],
+    summary: item.summary,
+    weak_points: JSON.parse(item.weak_points_json) as string[],
+    recommendations: JSON.parse(item.recommendations_json) as string[],
+    created_at: item.created_at
+  }));
+}
+
+export function getAssessmentReportCount() {
+  const [{ count }] = rows<{ count: number }>("SELECT COUNT(*) as count FROM assessment_reports;");
+  return count;
+}
+
+export function getLatestAssessmentReportCreatedAt() {
+  const [latest] = rows<{ created_at: string }>("SELECT created_at FROM assessment_reports ORDER BY created_at DESC, id DESC LIMIT 1;");
+  return latest?.created_at ?? null;
 }
 
 export function endSession(id: number) {

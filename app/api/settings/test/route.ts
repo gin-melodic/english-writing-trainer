@@ -8,6 +8,7 @@ export async function POST() {
     const result = await testConnection(getSettings());
     return NextResponse.json({ ok: true, models: result.data ?? [] });
   } catch (error) {
+    console.error("POST /api/settings/test failed", error);
     return NextResponse.json({ ok: false, message: error instanceof Error ? error.message : "连接失败" }, { status: 500 });
   }
 }

@@ -7,6 +7,7 @@ export type Settings = {
   model: string;
   temperature: number;
   dailyCount: number;
+  maxConcurrentPredictions: number;
 };
 
 export type Ability = {
@@ -18,11 +19,23 @@ export type Question = {
   id?: number;
   chinese: string;
   answers: string[];
+  vocabulary_tips?: string[];
   grammar_focus: string;
   dimension: Dimension;
+  secondary_dimensions?: Dimension[];
+  skills?: string[];
+  rubric_points?: string[];
   difficulty: number;
   source?: "ai" | "mistake";
   mistakeId?: number;
+};
+
+export type DimensionScore = {
+  dimension: Dimension;
+  score: number;
+  verdict: "correct" | "partial" | "wrong";
+  severity: "none" | "minor" | "major";
+  notes: string;
 };
 
 export type GradeResult = {
@@ -32,6 +45,8 @@ export type GradeResult = {
   differences: string[];
   explanations: string[];
   memory_tip?: string;
+  dimension_scores?: DimensionScore[];
+  skill_findings?: string[];
 };
 
 export type Mistake = {
@@ -59,4 +74,34 @@ export type AbilityHistory = {
   date: string;
   dimension: Dimension;
   score: number;
+};
+
+export type QuestionAnswerRecord = {
+  id: number;
+  session_id: number;
+  mode: string;
+  question_index: number;
+  question: Question;
+  user_answer: string;
+  result: GradeResult;
+  duration_seconds: number;
+  created_at: string;
+};
+
+export type AssessmentMatrixItem = {
+  dimension: Dimension;
+  score: number;
+  confidence: number;
+  evidence_count: number;
+};
+
+export type AssessmentReport = {
+  id: number;
+  session_id: number;
+  total_questions: number;
+  matrix: AssessmentMatrixItem[];
+  summary: string;
+  weak_points: string[];
+  recommendations: string[];
+  created_at: string;
 };
