@@ -50,7 +50,7 @@ export async function POST(request: Request) {
     const score = abilities.find((item) => item.dimension === dimension)?.score ?? 30;
     const difficulty = Number(body.difficulty) || chooseAdaptiveDifficulty(score || 30);
     const useThinking = mode === "能力测评" && Boolean(body.thinking);
-    const question = await generateQuestion(getSettings(), dimension, difficulty, mode === "能力测评", previousQuestions, regenerateReason, paperPosition, { thinking: useThinking });
+    const question = await generateQuestion(getSettings(), dimension, difficulty, true, previousQuestions, regenerateReason, paperPosition, { thinking: useThinking });
     return NextResponse.json({ question });
   } catch (error) {
     console.error("POST /api/question failed", error);

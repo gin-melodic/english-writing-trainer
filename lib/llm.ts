@@ -1,4 +1,4 @@
-import { DIMENSIONS, Dimension, DimensionScore, GradeResult, Question, Settings } from "./types";
+import { DIMENSIONS, Dimension, DimensionScore, GradeResult, Question, Settings, StudyGuide } from "./types";
 
 function stripCodeFence(text: string) {
   return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
@@ -47,6 +47,15 @@ type AssessmentNarrativePayload = {
   totalQuestions: number;
   matrix: Array<{ dimension: Dimension; score: number; confidence: number; evidence_count: number }>;
   findings: string[];
+};
+
+type StudyGuideQuestionOutline = {
+  dimension: Dimension;
+  secondary_dimensions?: Dimension[];
+  grammar_focus: string;
+  skills?: string[];
+  rubric_points?: string[];
+  difficulty: number;
 };
 
 function fallbackAssessmentNarrative(payload: AssessmentNarrativePayload) {
@@ -327,6 +336,47 @@ const assessmentNarrativeSchema: JsonSchema = {
   additionalProperties: false
 };
 
+const studyGuideSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    overview: { type: "string" },
+    sections: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          why_it_matters: { type: "string" },
+          explanation: { type: "string" },
+          key_points: { type: "array", items: { type: "string" } },
+          patterns: { type: "array", items: { type: "string" } },
+          contrast: { type: "array", items: { type: "string" } },
+          examples: { type: "array", items: { type: "string" } },
+          pitfalls: { type: "array", items: { type: "string" } },
+          drills: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                prompt: { type: "string" },
+                answer: { type: "string" },
+                explanation: { type: "string" }
+              },
+              required: ["prompt", "answer", "explanation"],
+              additionalProperties: false
+            }
+          }
+        },
+        required: ["title", "why_it_matters", "explanation", "key_points", "patterns", "contrast", "examples", "pitfalls", "drills"],
+        additionalProperties: false
+      }
+    },
+    checklist: { type: "array", items: { type: "string" } }
+  },
+  required: ["overview", "sections", "checklist"],
+  additionalProperties: false
+};
+
 function assessmentNarrativeMessages(payload: AssessmentNarrativePayload): ChatMessage[] {
   return [
     {
@@ -357,6 +407,149 @@ function normalizeAssessmentNarrative(parsed: { summary?: string; weak_points?: 
     summary: isMeaningfulText(summary) ? summary : fallback.summary,
     weak_points: weakPoints.length ? weakPoints : fallback.weak_points,
     recommendations: recommendations.length ? recommendations : fallback.recommendations
+  };
+}
+
+function fallbackStudyGuide(outlines: StudyGuideQuestionOutline[]): StudyGuide {
+  const dimensions = [...new Set(outlines.flatMap((item) => [item.dimension, ...(item.secondary_dimensions ?? [])]))];
+  const sections = dimensions.length ? dimensions : [DIMENSIONS[0]];
+  return {
+    overview: `今天的试卷主要涉及${sections.join("、")}。先把这些知识点的判断方法、常见句型和易错点梳理清楚，再进入答题会更稳定。`,
+    sections: sections.slice(0, 8).map((dimension) => ({
+      title: dimension,
+      why_it_matters: "这个知识点会直接影响句子的核心结构是否成立，做题前需要先建立判断顺序。",
+      explanation: DIMENSION_FALLBACK_EXPLANATIONS[dimension],
+      key_points: DIMENSION_FALLBACK_KEY_POINTS[dimension],
+      patterns: DIMENSION_FALLBACK_PATTERNS[dimension],
+      contrast: DIMENSION_FALLBACK_CONTRAST[dimension],
+      examples: DIMENSION_FALLBACK_EXAMPLES[dimension],
+      pitfalls: DIMENSION_FALLBACK_PITFALLS[dimension],
+      drills: DIMENSION_FALLBACK_DRILLS[dimension]
+    })),
+    checklist: [
+      "先判断句子的时间、主语和核心谓语，再考虑修饰信息。",
+      "遇到固定搭配、冠词和介词时，不要只按中文词序逐字翻译。",
+      "写完后检查动词形式、名词单复数、连接关系和信息是否遗漏。"
+    ]
+  };
+}
+
+const DIMENSION_FALLBACK_EXPLANATIONS: Record<Dimension, string> = {
+  "时态": "时态的核心是判断动作发生的时间、持续状态和与现在或过去某个时间点的关系。中译英时先确定谓语动词，再决定一般时、进行时、完成时或过去相关形式。",
+  "介词搭配": "介词搭配通常来自动词、形容词或名词的固定用法。不能只看中文里的“在、对、为”，要记住英语表达中常见的搭配单位。",
+  "定语从句": "定语从句用来修饰前面的名词。先找先行词，再判断关系词在从句里充当主语、宾语、地点、时间或所属关系。",
+  "连接词": "连接词负责表达句子之间的逻辑关系，如原因、结果、转折、条件、让步和并列。选择连接词前先说清两部分信息的关系。",
+  "被动语态": "被动语态强调动作承受者，基本结构是 be + 过去分词。时态变化体现在 be 动词上，过去分词保持不变。",
+  "冠词": "冠词体现名词是否可数、是否首次出现、是否特指。a/an 表泛指单数可数名词，the 表双方都知道或前文已出现的特指对象。"
+};
+
+const DIMENSION_FALLBACK_EXAMPLES: Record<Dimension, string[]> = {
+  "时态": ["她每天早上读英语。 -> She reads English every morning.", "我们到达时，会议已经开始了。 -> The meeting had started when we arrived."],
+  "介词搭配": ["他对这项计划很感兴趣。 -> He is interested in the plan.", "请专注于这个问题。 -> Please focus on this problem."],
+  "定语从句": ["我认识那个住在隔壁的老师。 -> I know the teacher who lives next door.", "这是我昨天提到的书。 -> This is the book that I mentioned yesterday."],
+  "连接词": ["虽然很晚了，她还是完成了报告。 -> Although it was late, she finished the report.", "如果明天下雨，我们就推迟会议。 -> If it rains tomorrow, we will put off the meeting."],
+  "被动语态": ["这封信是昨天写的。 -> The letter was written yesterday.", "这些问题必须今天解决。 -> These problems must be solved today."],
+  "冠词": ["我买了一本书。这本书很有用。 -> I bought a book. The book is useful.", "她是一名工程师。 -> She is an engineer."]
+};
+
+const DIMENSION_FALLBACK_KEY_POINTS: Record<Dimension, string[]> = {
+  "时态": ["先找时间线索，再确定谓语动词。", "一个完整句子通常只能有一个核心谓语，其他动作要处理成从句、非谓语或并列结构。", "完成时强调“对某个时间点已有影响或结果”，不是简单的“已经”。"],
+  "介词搭配": ["把动词、形容词、名词和介词作为搭配整体记忆。", "同一个中文介词在英文里可能对应不同介词。", "介词后面接名词、代词或动名词。"],
+  "定语从句": ["先行词决定关系词选择。", "关系词在从句里必须承担语法成分。", "从句修饰名词，不要把主句谓语挤进从句。"],
+  "连接词": ["先判断两部分信息的逻辑关系。", "从属连词引导从句，并列连词连接同等结构。", "英文通常避免 because 和 so 重复连接同一组因果。"],
+  "被动语态": ["动作承受者作主语时优先考虑被动。", "be 动词体现时态和主谓一致。", "过去分词不能代替完整谓语。"],
+  "冠词": ["先判断名词是否可数，再判断是否单数。", "首次泛指用 a/an，再次提到或双方已知用 the。", "抽象名词、复数泛指和不可数名词常用零冠词。"]
+};
+
+const DIMENSION_FALLBACK_PATTERNS: Record<Dimension, string[]> = {
+  "时态": ["一般过去时：主语 + 动词过去式 + 过去时间。", "现在完成时：主语 + have/has + 过去分词。", "过去完成时：主语 + had + 过去分词 + by/before/when..."],
+  "介词搭配": ["be interested in + 名词/动名词", "focus on + 名词/动名词", "be responsible for + 名词/动名词"],
+  "定语从句": ["人 + who/that + 谓语", "物 + which/that + 谓语", "地点 + where + 完整句子"],
+  "连接词": ["Because + 原因从句, 主句。", "Although + 让步从句, 主句。", "If + 条件从句, 主句。"],
+  "被动语态": ["一般现在时被动：am/is/are + 过去分词", "一般过去时被动：was/were + 过去分词", "情态动词被动：must/can/should + be + 过去分词"],
+  "冠词": ["a/an + 单数可数名词", "the + 特指名词", "零冠词 + 复数泛指/不可数泛指"]
+};
+
+const DIMENSION_FALLBACK_CONTRAST: Record<Dimension, string[]> = {
+  "时态": ["一般过去时讲过去事实；现在完成时强调现在相关结果。", "过去完成时表示过去的过去，通常需要另一个过去时间点作参照。"],
+  "介词搭配": ["look at 强调看；look for 强调寻找；look after 强调照顾。", "good at 是擅长；good for 是有益于。"],
+  "定语从句": ["who/which/that 在从句中可作主语或宾语；where/when 通常作状语。", "关系词作宾语时，后面不要再重复宾语代词。"],
+  "连接词": ["although 表让步，不等于 but；because 表原因，不等于 so。", "and 连接并列信息；but 连接转折信息。"],
+  "被动语态": ["主动语态强调执行者；被动语态强调承受者或结果。", "was done 是过去被动；has been done 是现在完成被动。"],
+  "冠词": ["a/an 表某一个；the 表这个/那个已确定对象。", "school 泛指上学活动时可零冠词；the school 指具体学校。"]
+};
+
+const DIMENSION_FALLBACK_PITFALLS: Record<Dimension, string[]> = {
+  "时态": ["看到中文没有明显时间词就忽略谓语形式。", "完成时和一般过去时混用。"],
+  "介词搭配": ["按中文逐字选择介词。", "把固定搭配中的介词漏掉。"],
+  "定语从句": ["关系词后重复写先行词。", "从句动词形式没有跟从句主语一致。"],
+  "连接词": ["because 和 so 在同一个英文句子里重复表达因果。", "转折、让步和条件关系混用。"],
+  "被动语态": ["只写过去分词，漏掉 be 动词。", "没有根据时态改变 be 的形式。"],
+  "冠词": ["单数可数名词前漏冠词。", "首次出现和再次特指都用同一个冠词。"]
+};
+
+const DIMENSION_FALLBACK_DRILLS: Record<Dimension, StudyGuide["sections"][number]["drills"]> = {
+  "时态": [
+    { prompt: "把“他昨晚给我打电话”译成英文。", answer: "He called me last night.", explanation: "last night 表明过去时间，谓语 call 要用过去式 called。" },
+    { prompt: "把“我已经完成作业了”译成英文。", answer: "I have finished my homework.", explanation: "强调现在已经完成的结果，用 have + 过去分词。" }
+  ],
+  "介词搭配": [
+    { prompt: "把“她擅长数学”译成英文。", answer: "She is good at math.", explanation: "擅长某事使用 be good at，不用 in 或 on。" },
+    { prompt: "把“我们正在等待结果”译成英文。", answer: "We are waiting for the result.", explanation: "wait for 是固定搭配，for 不能省略。" }
+  ],
+  "定语从句": [
+    { prompt: "把“那个正在唱歌的女孩是我妹妹”译成英文。", answer: "The girl who is singing is my sister.", explanation: "先行词是人，关系词 who 在从句中作主语。" },
+    { prompt: "把“我喜欢你推荐的电影”译成英文。", answer: "I like the movie that you recommended.", explanation: "movie 是先行词，that 在从句中作 recommended 的宾语。" }
+  ],
+  "连接词": [
+    { prompt: "把“因为路很滑，我们走得很慢”译成英文。", answer: "Because the road was slippery, we walked slowly.", explanation: "because 引导原因从句，主句说明结果。" },
+    { prompt: "把“如果你需要帮助，请告诉我”译成英文。", answer: "If you need help, please tell me.", explanation: "if 引导条件从句，主句给出条件成立时的动作。" }
+  ],
+  "被动语态": [
+    { prompt: "把“这个房间每天都被打扫”译成英文。", answer: "This room is cleaned every day.", explanation: "room 是动作承受者，一般现在时被动用 is cleaned。" },
+    { prompt: "把“这个决定将由经理宣布”译成英文。", answer: "The decision will be announced by the manager.", explanation: "将来被动结构是 will be + 过去分词。" }
+  ],
+  "冠词": [
+    { prompt: "把“她想买一把伞”译成英文。", answer: "She wants to buy an umbrella.", explanation: "umbrella 是单数可数名词且以元音音素开头，泛指用 an。" },
+    { prompt: "把“太阳今天很亮”译成英文。", answer: "The sun is bright today.", explanation: "sun 是独一无二的事物，通常用定冠词 the。" }
+  ]
+};
+
+function normalizeStudyGuide(parsed: Partial<StudyGuide>, outlines: StudyGuideQuestionOutline[]): StudyGuide {
+  const fallback = fallbackStudyGuide(outlines);
+  function normalizeDrills(value: unknown): StudyGuide["sections"][number]["drills"] {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+      if (typeof item === "string") {
+        return { prompt: item, answer: "", explanation: "" };
+      }
+      if (!item || typeof item !== "object") return undefined;
+      const raw = item as Record<string, unknown>;
+      return {
+        prompt: toText(raw.prompt).trim(),
+        answer: toText(raw.answer).trim(),
+        explanation: toText(raw.explanation).trim()
+      };
+    }).filter((item): item is StudyGuide["sections"][number]["drills"][number] => Boolean(item?.prompt)).slice(0, 4);
+  }
+  const sections = Array.isArray(parsed.sections)
+    ? parsed.sections.map((section) => ({
+      title: toText(section?.title).trim(),
+      why_it_matters: toText(section?.why_it_matters).trim(),
+      explanation: toText(section?.explanation).trim(),
+      key_points: toTextArray(section?.key_points).filter(isMeaningfulText).slice(0, 8),
+      patterns: toTextArray(section?.patterns).filter(isMeaningfulText).slice(0, 8),
+      contrast: toTextArray(section?.contrast).filter(isMeaningfulText).slice(0, 8),
+      examples: toTextArray(section?.examples).filter(isMeaningfulText).slice(0, 4),
+      pitfalls: toTextArray(section?.pitfalls).filter(isMeaningfulText).slice(0, 4),
+      drills: normalizeDrills(section?.drills)
+    })).filter((section) => Boolean(section.title) && isMeaningfulText(section.explanation)).slice(0, 8)
+    : [];
+  const checklist = toTextArray(parsed.checklist).filter(isMeaningfulText).slice(0, 8);
+  return {
+    overview: isMeaningfulText(parsed.overview) ? toText(parsed.overview).trim() : fallback.overview,
+    sections: sections.length ? sections : fallback.sections,
+    checklist: checklist.length ? checklist : fallback.checklist
   };
 }
 
@@ -505,7 +698,7 @@ export async function generateQuestion(
 难度：${difficulty}/100
 要求：
 1. 中文句子自然、适合中文母语者练习英语写作。
-2. 尽量使用初级英语词汇和常见生活场景，避免生僻词、抽象名词、复杂专业表达。
+2. 尽量使用初级英语词汇和常见生活场景，避免生僻词、抽象名词、复杂专业表达。题目尽量贴近实际生活场景，不要生搬硬套。
 3. 主要难点必须来自语法结构，而不是词汇理解。
 4. 英文参考答案以短句或中等长度句子为主，不要为了提高难度使用高级词汇。
 5. 参考答案给 1-2 个英文变体；明确说明考查语法点。
@@ -568,6 +761,50 @@ score、verdict、severity 和 notes 必须一致：correct 通常为 80-100，p
     dimension_scores: dimensionScores,
     skill_findings: toTextArray(parsed.skill_findings).slice(0, 6)
   };
+}
+
+export async function generateStudyGuide(
+  settings: Settings,
+  outlines: StudyGuideQuestionOutline[]
+): Promise<StudyGuide> {
+  const safeOutlines = outlines.map((item) => ({
+    dimension: item.dimension,
+    secondary_dimensions: item.secondary_dimensions?.filter((dimension) => (DIMENSIONS as readonly string[]).includes(dimension)).slice(0, 3),
+    grammar_focus: toText(item.grammar_focus).slice(0, 120),
+    skills: toTextArray(item.skills).slice(0, 4),
+    rubric_points: toTextArray(item.rubric_points).slice(0, 4),
+    difficulty: Math.max(1, Math.min(100, Math.round(Number(item.difficulty) || 50)))
+  })).slice(0, 50);
+  if (safeOutlines.length < 1) return fallbackStudyGuide([]);
+
+  try {
+    const parsed = await chat<StudyGuide>(settings, [
+      {
+        role: "system",
+        content: "你是一位面向中文母语者的英语写作课老师。请按结构化输出 schema 生成中文专项学习材料。"
+      },
+      {
+        role: "user",
+        content: `请根据今天试卷涉及的知识点，生成做题前专项学习材料。
+只允许使用以下知识点元数据，不得猜测、复述、改写或透露原试卷题目和参考答案：
+${JSON.stringify(safeOutlines)}
+
+要求：
+1. overview 用 3-5 句话说明今天需要先学哪些知识点，以及这些知识点之间可能如何组合。
+2. sections 必须尽量贴合 grammar_focus、skills、rubric_points 中出现的具体知识点，不要只写“时态、冠词”这种大类标题；相近知识点可以合并成一个深入专题。
+3. 每个 section 都要深入：why_it_matters 说明为什么今天需要学；explanation 讲清规则、判断步骤、结构边界和中文母语者容易误判的原因，至少 120 个汉字。
+4. key_points 给 5-8 条可执行规则，必须包含判断顺序、结构边界、常见替换误区和检查方法；patterns 给 4-8 条句型模板；contrast 给 3-6 条相近结构辨析；examples 给 3-4 个“同类知识点的新例句”；pitfalls 给 3-4 个易错点。
+5. drills 给 3-4 个新练习，每个练习必须包含 prompt、answer、explanation。prompt 是中文待译句，answer 是英文参考答案，explanation 说明为什么这样写以及对应哪个规则。
+6. examples 和 drills 必须使用全新的句子，不得出现“原题、试卷、答案、参考答案”等字样，也不得暗示今天原题内容。
+7. 本接口已启用 thinking 模式，请先在内部分析所有 grammar_focus、skills、rubric_points 的重合点和差异，再输出最终 JSON；最终 JSON 不要写推理过程。
+8. checklist 应该是做题前最后检查清单，覆盖今天材料中的关键结构。`
+      }
+    ], "study_guide", studyGuideSchema, { thinking: true });
+    return normalizeStudyGuide(parsed, safeOutlines);
+  } catch (error) {
+    console.error("LM Studio study guide failed, using fallback", error);
+    return fallbackStudyGuide(safeOutlines);
+  }
 }
 
 export async function generateAssessmentNarrative(

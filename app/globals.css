@@ -398,6 +398,145 @@ select:focus {
   line-height: 1.35;
 }
 
+.study-page {
+  display: grid;
+  gap: 18px;
+}
+
+.study-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.study-nav {
+  position: sticky;
+  top: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #14171a;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.study-nav button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: flex-start;
+  text-align: left;
+  width: 100%;
+}
+
+.study-nav button span {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: #20262d;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.study-nav button.active {
+  border-color: var(--accent);
+  background: rgba(92, 200, 255, 0.12);
+}
+
+.study-note {
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  font-size: 13px;
+}
+
+.study-main {
+  display: grid;
+  gap: 16px;
+}
+
+.study-lesson {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 20px;
+}
+
+.study-lesson-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 14px;
+  margin-bottom: 16px;
+}
+
+.study-lesson h2,
+.study-lesson h3 {
+  margin-top: 0;
+}
+
+.study-lesson section {
+  margin-top: 18px;
+}
+
+.study-lesson p {
+  line-height: 1.75;
+}
+
+.study-lesson ul,
+.study-checklist ul {
+  margin: 8px 0 14px;
+  padding-left: 20px;
+}
+
+.study-lesson li,
+.study-checklist li {
+  margin: 6px 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.example-line {
+  border-left: 3px solid var(--accent);
+  padding: 8px 0 8px 12px;
+  background: rgba(92, 200, 255, 0.06);
+}
+
+.drill-list {
+  display: grid;
+  gap: 12px;
+}
+
+.drill-item {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #14171a;
+  padding: 14px;
+}
+
+.drill-item p {
+  margin-top: 0;
+}
+
+.drill-answer {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.drill-answer p {
+  color: var(--muted);
+  margin: 8px 0 0;
+}
+
+.study-checklist {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #14171a;
+  padding: 16px;
+}
+
 .report-list {
   display: grid;
   gap: 12px;
@@ -749,8 +888,13 @@ select:focus {
   .assessment-controls,
   .dimension-list,
   .extension-grid,
+  .study-layout,
   .report-row {
     grid-template-columns: 1fr;
+  }
+
+  .study-nav {
+    position: static;
   }
 
   .topbar,

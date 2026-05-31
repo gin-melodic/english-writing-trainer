@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, History, RotateCcw, Settings as SettingsIcon, Target, Trash2, X } from "lucide-react";
-import { Ability, AbilityHistory, AssessmentReport, DIMENSIONS, Dimension, GradeResult, Mistake, Question, Settings, TrainingRecord } from "@/lib/types";
+import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, RotateCcw, Settings as SettingsIcon, Target, Trash2, X } from "lucide-react";
+import { Ability, AbilityHistory, AssessmentReport, DIMENSIONS, Dimension, GradeResult, Mistake, Question, Settings, StudyGuide, TrainingRecord } from "@/lib/types";
 
 type View = "能力测评" | "每日练习" | "专项训练" | "错题重练" | "数据统计" | "设置";
 type TrainingMode = "能力测评" | "每日练习" | "专项训练" | "错题重练";
@@ -387,6 +387,8 @@ export default function Home() {
   const [questionQueue, setQuestionQueue] = useState<Question[]>([]);
   const [answerRecords, setAnswerRecords] = useState<Record<number, AnswerRecord>>({});
   const [paperNotes, setPaperNotes] = useState<Record<number, PaperNote>>({});
+  const [studyGuide, setStudyGuide] = useState<StudyGuide>();
+  const [studyGuideOpen, setStudyGuideOpen] = useState(false);
   const [sessionStarted, setSessionStarted] = useState(false);
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
@@ -471,10 +473,11 @@ export default function Home() {
     }
 
     if (nextMode === "每日练习") {
-      questions.push(...activeMistakes.slice(0, nextTotal).map((mistake) => ({ ...mistake, source: "mistake", mistakeId: mistake.id }) satisfies Question));
-      if (questions.length > 0) {
-        setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已加入 ${questions.length} 道错题，正在补齐本次练习试卷。`);
-      }
+      // 每日练习包含错题
+      // questions.push(...activeMistakes.slice(0, nextTotal).map((mistake) => ({ ...mistake, source: "mistake", mistakeId: mistake.id }) satisfies Question));
+      // if (questions.length > 0) {
+      //   setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已加入 ${questions.length} 道错题，正在补齐本次练习试卷。`);
+      // }
     }
 
     const aiTotal = nextTotal - questions.length;
@@ -524,6 +527,8 @@ export default function Home() {
       setQuestionQueue([]);
       setAnswerRecords({});
       setPaperNotes({});
+      setStudyGuide(undefined);
+      setStudyGuideOpen(false);
       setAssessmentExtension({ phase: "idle" });
       setSessionStarted(false);
       setActiveMode(undefined);
@@ -590,6 +595,39 @@ export default function Home() {
       setError(errorMessage(err, "单题重生成失败，请重试。"));
     } finally {
       setPaperNotes((prev) => ({ ...prev, [index]: { ...prev[index], loading: false } }));
+      setStudyGuide(undefined);
+      setStudyGuideOpen(false);
+    }
+  }
+
+  async function generatePaperStudyGuide() {
+    if (questionQueue.length < 1) return;
+    if (studyGuide) {
+      setStudyGuideOpen(true);
+      return;
+    }
+    setError("");
+    setLoading("AI 正在生成专项学习内容…");
+    try {
+      const data = await api<{ guide: StudyGuide }>("/api/study", {
+        method: "POST",
+        body: JSON.stringify({
+          questions: questionQueue.map((question) => ({
+            dimension: question.dimension,
+            secondary_dimensions: question.secondary_dimensions,
+            grammar_focus: question.grammar_focus,
+            skills: question.skills,
+            rubric_points: question.rubric_points,
+            difficulty: question.difficulty
+          }))
+        })
+      });
+      setStudyGuide(data.guide);
+      setStudyGuideOpen(true);
+    } catch (err) {
+      setError(errorMessage(err, "专项学习内容生成失败，请重试。"));
+    } finally {
+      setLoading("");
     }
   }
 
@@ -609,6 +647,8 @@ export default function Home() {
       setSessionStarted(true);
       setAssessmentExtension({ phase: "idle" });
       setPaperNotes({});
+      setStudyGuide(undefined);
+      setStudyGuideOpen(false);
       setQuestionStartedAt(Date.now());
     } catch (err) {
       setError(errorMessage(err, "训练启动失败，请重试。"));
@@ -626,6 +666,8 @@ export default function Home() {
     setQuestionQueue([]);
     setAnswerRecords({});
     setPaperNotes({});
+    setStudyGuide(undefined);
+    setStudyGuideOpen(false);
     setAssessmentExtension({ phase: "idle" });
     setProgress({ current: 0, total: startTotal });
   }
@@ -849,6 +891,8 @@ export default function Home() {
         setQuestionQueue([]);
         setAnswerRecords({});
         setPaperNotes({});
+        setStudyGuide(undefined);
+        setStudyGuideOpen(false);
         setAssessmentExtension({ phase: "idle" });
         await refresh();
         setView("数据统计");
@@ -973,7 +1017,18 @@ export default function Home() {
           />
         )}
 
-        {paperPreview && visibleTrainingView && activeMode && (
+        {paperPreview && visibleTrainingView && activeMode && studyGuideOpen && studyGuide && (
+          <StudyGuidePage
+            mode={activeMode}
+            guide={studyGuide}
+            loading={loading}
+            error={error}
+            onBack={() => setStudyGuideOpen(false)}
+            onBegin={beginAnswering}
+          />
+        )}
+
+        {paperPreview && visibleTrainingView && activeMode && (!studyGuideOpen || !studyGuide) && (
           <PaperPreview
             mode={activeMode}
             questions={questionQueue}
@@ -982,6 +1037,7 @@ export default function Home() {
             loading={loading}
             error={error}
             onRegenerate={regenerateQuestion}
+            onStudy={generatePaperStudyGuide}
             onBegin={beginAnswering}
             onAbandon={abandonPaper}
           />
@@ -1222,7 +1278,7 @@ function StartPage({ mode, state, total, specialDimension, setSpecialDimension, 
   );
 }
 
-function PaperPreview({ mode, questions, notes, setNotes, loading, error, onRegenerate, onBegin, onAbandon }: {
+function PaperPreview({ mode, questions, notes, setNotes, loading, error, onRegenerate, onStudy, onBegin, onAbandon }: {
   mode: TrainingMode;
   questions: Question[];
   notes: Record<number, PaperNote>;
@@ -1230,9 +1286,11 @@ function PaperPreview({ mode, questions, notes, setNotes, loading, error, onRege
   loading: string;
   error: string;
   onRegenerate: (index: number) => void;
+  onStudy: () => void;
   onBegin: () => void;
   onAbandon: () => void;
 }) {
+  const canStudy = mode === "每日练习";
   return (
     <section>
       <div className="topbar">
@@ -1241,6 +1299,7 @@ function PaperPreview({ mode, questions, notes, setNotes, loading, error, onRege
           <p className="muted">共 {questions.length} 题。可以为单题填写调整原因并重新生成，确认后再开始答题。</p>
         </div>
         <div className="row">
+          {canStudy && <button onClick={onStudy} disabled={Boolean(loading)}><GraduationCap size={16} /> 专项学习</button>}
           <button className="danger" onClick={onAbandon} disabled={Boolean(loading)}><Trash2 size={16} /> 放弃试卷</button>
           <button className="primary" onClick={onBegin} disabled={Boolean(loading)}>开始</button>
         </div>
@@ -1272,6 +1331,110 @@ function PaperPreview({ mode, questions, notes, setNotes, loading, error, onRege
             />
           </section>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function StudyGuidePage({ mode, guide, loading, error, onBack, onBegin }: {
+  mode: TrainingMode;
+  guide: StudyGuide;
+  loading: string;
+  error: string;
+  onBack: () => void;
+  onBegin: () => void;
+}) {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [visibleDrillAnswers, setVisibleDrillAnswers] = useState<Record<string, boolean>>({});
+  const activeSection = guide.sections[activeIndex] ?? guide.sections[0];
+  return (
+    <section className="study-page">
+      <div className="topbar">
+        <div>
+          <h1 className="title">{mode} · 做题前专项学习</h1>
+          <p className="muted">{guide.overview}</p>
+        </div>
+        <div className="row">
+          <button onClick={onBack}>返回试卷</button>
+          <button className="primary" onClick={onBegin} disabled={Boolean(loading)}>开始答题</button>
+        </div>
+      </div>
+      {loading && <p className="loading"><span className="spinner" />{loading}</p>}
+      {error && <div className="notice">{error}</div>}
+      <div className="study-layout">
+        <aside className="study-nav" aria-label="专项学习目录">
+          <strong>学习目录</strong>
+          {guide.sections.map((section, index) => (
+            <button key={`${section.title}-${index}`} className={index === activeIndex ? "active" : ""} onClick={() => setActiveIndex(index)}>
+              <span>{index + 1}</span>
+              {section.title}
+            </button>
+          ))}
+          <div className="study-note">不展示原题和答案</div>
+        </aside>
+
+        <div className="study-main">
+          {activeSection && (
+            <article className="study-lesson">
+              <div className="study-lesson-head">
+                <span className="tag">专题 {activeIndex + 1}</span>
+                <h2>{activeSection.title}</h2>
+                <p>{activeSection.why_it_matters}</p>
+              </div>
+              <section>
+                <h3>深入讲解</h3>
+                <p>{activeSection.explanation}</p>
+              </section>
+              <section>
+                <h3>核心规则</h3>
+                <ul>{activeSection.key_points.map((item, index) => <li key={index}>{item}</li>)}</ul>
+              </section>
+              <section>
+                <h3>句型模板</h3>
+                <ul>{activeSection.patterns.map((item, index) => <li key={index}>{item}</li>)}</ul>
+              </section>
+              <section>
+                <h3>对比辨析</h3>
+                <ul>{activeSection.contrast.map((item, index) => <li key={index}>{item}</li>)}</ul>
+              </section>
+              <section>
+                <h3>同类例句</h3>
+                {activeSection.examples.map((example, index) => <p className="example-line" key={index}>{example}</p>)}
+              </section>
+              <section>
+                <h3>易错点</h3>
+                <ul>{activeSection.pitfalls.map((item, index) => <li key={index}>{item}</li>)}</ul>
+              </section>
+              <section>
+                <h3>练习句</h3>
+                <div className="drill-list">
+                  {activeSection.drills.map((item, index) => {
+                    const key = `${activeIndex}-${index}`;
+                    const visible = Boolean(visibleDrillAnswers[key]);
+                    return (
+                      <div className="drill-item" key={key}>
+                        <p>{item.prompt}</p>
+                        <button onClick={() => setVisibleDrillAnswers((prev) => ({ ...prev, [key]: !prev[key] }))}>
+                          {visible ? "隐藏答案" : "显示答案"}
+                        </button>
+                        {visible && (
+                          <div className="drill-answer">
+                            <strong>{item.answer}</strong>
+                            {item.explanation && <p>{item.explanation}</p>}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            </article>
+          )}
+          <aside className="study-checklist">
+            <strong>答题前检查</strong>
+            <ul>{guide.checklist.map((item, index) => <li key={index}>{item}</li>)}</ul>
+          </aside>
+        </div>
       </div>
     </section>
   );

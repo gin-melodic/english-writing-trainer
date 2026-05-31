@@ -3,7 +3,7 @@ require("./setup.cjs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { generateAssessmentNarrativeStream, generateQuestion, gradeAnswer } = require("../lib/llm.ts");
+const { generateAssessmentNarrativeStream, generateQuestion, generateStudyGuide, gradeAnswer } = require("../lib/llm.ts");
 
 function settings() {
   return {
@@ -217,6 +217,64 @@ test("question generation accepts structured JSON from reasoning_content when co
     assert.equal(question.chinese, "这种水果通常只在夏天才能买到。");
     assert.equal(question.answers[0], "This kind of fruit is usually only available in summer.");
     assert.deepEqual(question.secondary_dimensions, ["时态", "介词搭配"]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("study guide generation uses outlines without original questions or answers", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            overview: "今天先复习时态和冠词。",
+            sections: [{
+              title: "一般过去时",
+              why_it_matters: "一般过去时是今天需要稳定掌握的核心谓语形式。",
+              explanation: "一般过去时表示过去发生的动作，谓语通常使用过去式。",
+              key_points: ["先找过去时间线索。"],
+              patterns: ["主语 + 动词过去式 + 过去时间。"],
+              contrast: ["一般过去时强调过去事实，现在完成时强调现在结果。"],
+              examples: ["我昨晚复习了英语。 -> I reviewed English last night."],
+              pitfalls: ["不要忘记把动词改成过去式。"],
+              drills: [{
+                prompt: "把“她昨天打扫了房间”译成英文。",
+                answer: "She cleaned the room yesterday.",
+                explanation: "yesterday 表明过去时间，clean 用过去式 cleaned。"
+              }]
+            }],
+            checklist: ["先判断时间，再检查谓语形式。"]
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const guide = await generateStudyGuide(settings(), [{
+      dimension: "时态",
+      secondary_dimensions: ["冠词"],
+      grammar_focus: "一般过去时",
+      skills: ["过去式动词"],
+      rubric_points: ["动词使用过去式"],
+      difficulty: 45,
+      chinese: "昨天我完成了作业。",
+      answers: ["I finished my homework yesterday."]
+    }]);
+
+    const prompt = requests[0].messages.map((message) => message.content).join("\n");
+    assert.equal(prompt.includes("昨天我完成了作业"), false);
+    assert.equal(prompt.includes("I finished my homework yesterday"), false);
+    assert.equal(requests[0].enable_thinking, true);
+    assert.equal(guide.sections[0].title, "一般过去时");
+    assert.equal(guide.sections[0].drills[0].answer, "She cleaned the room yesterday.");
   } finally {
     global.fetch = originalFetch;
   }

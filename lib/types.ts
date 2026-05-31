@@ -30,6 +30,28 @@ export type Question = {
   mistakeId?: number;
 };
 
+export type StudyGuideSection = {
+  title: string;
+  why_it_matters: string;
+  explanation: string;
+  key_points: string[];
+  patterns: string[];
+  contrast: string[];
+  examples: string[];
+  pitfalls: string[];
+  drills: Array<{
+    prompt: string;
+    answer: string;
+    explanation: string;
+  }>;
+};
+
+export type StudyGuide = {
+  overview: string;
+  sections: StudyGuideSection[];
+  checklist: string[];
+};
+
 export type DimensionScore = {
   dimension: Dimension;
   score: number;
