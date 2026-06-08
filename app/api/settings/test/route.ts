@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSettings, initDb } from "@/lib/db";
+import { authErrorResponse, requireUser } from "@/lib/auth";
 import { ConnectionTestResult, testConnection } from "@/lib/llm";
 import { Settings } from "@/lib/types";
 
@@ -21,11 +22,15 @@ function attachedResult(error: unknown): ConnectionTestResult | undefined {
 export async function POST(request: Request) {
   try {
     initDb();
+    const user = requireUser(request);
+    if (user.role !== "admin") return NextResponse.json({ message: "需要管理员权限。" }, { status: 403 });
     const body = await request.json().catch(() => undefined);
-    const settings = normalizeSettings({ ...getSettings(), ...(body && typeof body === "object" ? body : {}) });
+    const settings = normalizeSettings({ ...getSettings(user.id), ...(body && typeof body === "object" ? body : {}) });
     const result = await testConnection(settings);
     return NextResponse.json({ ok: true, ...result });
   } catch (error) {
+    const authResponse = authErrorResponse(error);
+    if (authResponse) return authResponse;
     const result = attachedResult(error);
     console.error("POST /api/settings/test failed", {
       message: error instanceof Error ? error.message : "连接失败",

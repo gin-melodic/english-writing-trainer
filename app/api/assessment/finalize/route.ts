@@ -1,9 +1,17 @@
 import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getSettings, getSkillAbilities, initDb, setAbility, setSkillAbility } from "@/lib/db";
+import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateAssessmentNarrativeStream } from "@/lib/llm";
 import { assessmentEvidenceDetails, assessmentFindings, calculateAssessmentMatrix, calculateAssessmentSkillAbilityUpdates, mergeAssessmentScore } from "@/lib/assessment";
 import { Dimension } from "@/lib/types";
 
 export async function POST(request: Request) {
+  initDb();
+  let user;
+  try {
+    user = requireUser(request);
+  } catch (error) {
+    return authErrorResponse(error) ?? new Response(JSON.stringify({ message: "请先登录。" }), { status: 401 });
+  }
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
@@ -11,12 +19,11 @@ export async function POST(request: Request) {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
       try {
-        initDb();
         const { sessionId } = (await request.json()) as { sessionId?: number };
         if (!sessionId) throw new Error("缺少测评 sessionId");
 
         send("matrix", { title: "正在读取测评记录", detail: "正在汇总本次测评的逐题批改结果。", percent: 80 });
-        const records = getQuestionAnswers(Number(sessionId)).filter((item) => item.mode === "能力测评");
+        const records = getQuestionAnswers(Number(sessionId), user.id).filter((item) => item.mode === "能力测评");
         if (records.length < 1) throw new Error("没有可用于生成报告的测评答题记录");
 
         const matrix = calculateAssessmentMatrix(records);
@@ -36,7 +43,7 @@ export async function POST(request: Request) {
           totalQuestions: records.length
         });
         let lastProgressAt = 0;
-        const narrative = await generateAssessmentNarrativeStream(getSettings(), {
+        const narrative = await generateAssessmentNarrativeStream(getSettings(user.id), {
           totalQuestions: records.length,
           matrix,
           findings,
@@ -65,18 +72,19 @@ export async function POST(request: Request) {
           totalQuestions: records.length
         });
 
-        const currentAbilities = getAbilities();
+        const currentAbilities = getAbilities(user.id);
         const initializing = currentAbilities.every((item) => item.evidence_count === 0);
         for (const item of matrix) {
           const current = currentAbilities.find((ability) => ability.dimension === item.dimension);
           setAbility(
             item.dimension as Dimension,
             mergeAssessmentScore(current?.score ?? 50, item.score, item.confidence, initializing),
-            (current?.evidence_count ?? 0) + item.evidence_count
+            (current?.evidence_count ?? 0) + item.evidence_count,
+            user.id
           );
         }
-        for (const update of calculateAssessmentSkillAbilityUpdates(getSkillAbilities(), records)) {
-          setSkillAbility(update);
+        for (const update of calculateAssessmentSkillAbilityUpdates(getSkillAbilities(user.id), records)) {
+          setSkillAbility(update, user.id);
         }
 
         const createdAt = new Date().toISOString();
@@ -87,8 +95,8 @@ export async function POST(request: Request) {
           summary: narrative.summary,
           weakPoints: narrative.weak_points,
           recommendations: narrative.recommendations
-        });
-        endSession(Number(sessionId));
+        }, user.id);
+        endSession(Number(sessionId), user.id);
 
         send("done", {
           title: "报告已生成",
@@ -104,8 +112,8 @@ export async function POST(request: Request) {
             recommendations: narrative.recommendations,
             created_at: createdAt
           },
-          abilities: getAbilities(),
-          skillAbilities: getSkillAbilities()
+          abilities: getAbilities(user.id),
+          skillAbilities: getSkillAbilities(user.id)
         });
       } catch (error) {
         console.error("POST /api/assessment/finalize failed", error);

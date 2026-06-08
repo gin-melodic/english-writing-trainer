@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, MessageCircle, MessageSquarePlus, RotateCcw, Send, Settings as SettingsIcon, Target, Trash2, X } from "lucide-react";
+import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, LogOut, MessageCircle, MessageSquarePlus, RotateCcw, Send, Settings as SettingsIcon, Shield, Target, Trash2, X } from "lucide-react";
 import AbilityMotionField from "./AbilityMotionField";
 import { publicQuestionSkills } from "@/lib/questionSafety";
 import { Ability, AbilityHistory, AssessmentReport, CapturedDrill, DIMENSIONS, Dimension, DrillCard, FollowUpMessage, GradeResult, Mistake, PracticeReport, Question, Settings, SkillAbility, StudyGuide, TrainingRecord } from "@/lib/types";
@@ -87,12 +87,18 @@ type CaptureState = {
   error: string;
   saved: boolean;
 };
+type CurrentUser = {
+  id: number;
+  username: string;
+  role: "admin" | "user";
+};
 type QuestionResponse = {
   question?: Question;
   questions?: Question[];
   done?: boolean;
 };
 type AppState = {
+  user: CurrentUser | null;
   settings: Settings;
   abilities: Ability[];
   skillAbilities: SkillAbility[];
@@ -115,6 +121,7 @@ type AppState = {
 };
 
 const emptyState: AppState = {
+  user: null,
   settings: { baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20, maxConcurrentPredictions: 5 },
   abilities: DIMENSIONS.map((dimension) => ({ dimension, score: 50, evidence_count: 0 })),
   skillAbilities: [],
@@ -176,6 +183,9 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) }
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && typeof window !== "undefined") {
+    window.location.href = "/login";
+  }
   if (!res.ok) throw new Error(data.message || "请求失败");
   return data as T;
 }
@@ -573,6 +583,11 @@ export default function Home() {
   useEffect(() => {
     refresh().catch((err) => setError(err.message));
   }, [refresh]);
+
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    window.location.href = "/login";
+  }
 
   const activeQuestion = questionQueue[progress.current];
   const activeRecord = answerRecords[progress.current] ?? { answer: "" };
@@ -1154,6 +1169,15 @@ export default function Home() {
     <div className="app" onKeyDown={onKeyDown}>
       <aside className="sidebar">
         <div className="brand">中译英<br />自适应训练系统</div>
+        {state.user && (
+          <div className="user-strip">
+            <span>{state.user.username}</span>
+            <div className="user-actions">
+              {state.user.role === "admin" && <a href="/admin" aria-label="管理员"><Shield size={16} /></a>}
+              <button type="button" onClick={logout} aria-label="退出登录"><LogOut size={16} /></button>
+            </div>
+          </div>
+        )}
         <div className="streak">连续训练 {state.streak} 天</div>
         <div className="nav">
           {navItems.map((item) => (
@@ -1337,7 +1361,7 @@ export default function Home() {
         )}
 
         {view === "设置" && !assessment && (
-          <SettingsPanel draft={settingsDraft} setDraft={setSettingsDraft} refresh={refresh} setError={setError} error={error} />
+          <SettingsPanel draft={settingsDraft} setDraft={setSettingsDraft} refresh={refresh} setError={setError} error={error} isAdmin={state.user?.role === "admin"} />
         )}
 
         <button className="capture-fab" type="button" onClick={openCapture} aria-label="快速捕捉表达">
@@ -2090,12 +2114,13 @@ function PracticeReportView({ report }: { report: PracticeReport }) {
   );
 }
 
-function SettingsPanel({ draft, setDraft, refresh, setError, error }: {
+function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
   draft: Settings;
   setDraft: (value: Settings) => void;
   refresh: () => Promise<void>;
   setError: (value: string) => void;
   error: string;
+  isAdmin: boolean;
 }) {
   const [message, setMessage] = useState("");
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
@@ -2135,15 +2160,21 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error }: {
     <section>
       <h1 className="title">设置</h1>
       <div className="section form-grid">
-        <label>LM Studio 服务地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
-        <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="填写 LM Studio 中加载的模型名" /></label>
-        <label>Temperature<input type="number" min="0" max="1" step="0.1" value={draft.temperature} onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })} /></label>
+        {isAdmin && (
+          <>
+            <label>LM Studio 服务地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
+            <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="填写 LM Studio 中加载的模型名" /></label>
+            <label>Temperature<input type="number" min="0" max="1" step="0.1" value={draft.temperature} onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })} /></label>
+          </>
+        )}
         <label>每日练习题数<input type="number" min="10" max="50" value={draft.dailyCount} onChange={(e) => setDraft({ ...draft, dailyCount: Number(e.target.value) })} /></label>
-        <label>应用并发生成数<input type="number" min="1" max="10" value={draft.maxConcurrentPredictions} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">建议与 LM Studio 的 Max Concurrent Predictions 保持一致。</span></label>
+        {isAdmin && (
+          <label>应用并发生成数<input type="number" min="1" max="10" value={draft.maxConcurrentPredictions} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">建议与 LM Studio 的 Max Concurrent Predictions 保持一致。</span></label>
+        )}
       </div>
       <div className="actions" style={{ justifyContent: "flex-start" }}>
         <button className="primary" onClick={save}>保存设置</button>
-        <button onClick={test}>测试连接</button>
+        {isAdmin && <button onClick={test}>测试连接</button>}
         <button onClick={() => reset("assessment")}>重置能力评估</button>
         <button className="danger" onClick={() => reset("all")}>清除所有数据</button>
       </div>

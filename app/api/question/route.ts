@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getAbilities, getCapturedDrillQuestions, getMistakes, getSettings, getSkillAbilities, initDb } from "@/lib/db";
+import { authErrorResponse, requireUser } from "@/lib/auth";
 import { chooseAdaptiveDifficulty, chooseLowestDimension, generateQuestion, generateQuestions } from "@/lib/llm";
 import { DIMENSIONS, Dimension, Question } from "@/lib/types";
 
@@ -21,8 +22,9 @@ function chooseBatchDimension(abilities: ReturnType<typeof getAbilities>, index:
 export async function POST(request: Request) {
   try {
     initDb();
+    const user = requireUser(request);
     const body = await request.json();
-    const abilities = getAbilities();
+    const abilities = getAbilities(user.id);
     const mode = String(body.mode || "每日练习");
     const excludeMistakeIds = Array.isArray(body.excludeMistakeIds)
       ? body.excludeMistakeIds.map((id: unknown) => Number(id)).filter(Number.isFinite)
@@ -43,25 +45,25 @@ export async function POST(request: Request) {
     const captureOnly = Boolean(body.captureOnly) || body.origin === "user_capture";
 
     if (captureOnly && mode !== "能力测评") {
-      const captured = getCapturedDrillQuestions(false).filter((item) => !excludeCaptureIds.includes(item.captureId ?? 0));
+      const captured = getCapturedDrillQuestions(false, user.id).filter((item) => !excludeCaptureIds.includes(item.captureId ?? 0));
       if (!captured.length) return NextResponse.json({ done: true });
       return NextResponse.json({ question: captured[0], questions: Array.isArray(body.questions) ? captured.slice(0, body.questions.length) : undefined });
     }
 
     if (mode === "错题重练" && !forceAi) {
-      const mistake = getMistakes(true).find((item) => !excludeMistakeIds.includes(item.id));
+      const mistake = getMistakes(true, user.id).find((item) => !excludeMistakeIds.includes(item.id));
       if (!mistake) return NextResponse.json({ done: true });
       const question: Question = { ...mistake, source: "mistake", mistakeId: mistake.id };
       return NextResponse.json({ question });
     }
 
     if (mode === "每日练习" && !forceAi) {
-      const mistake = getMistakes(true).find((item) => !excludeMistakeIds.includes(item.id));
+      const mistake = getMistakes(true, user.id).find((item) => !excludeMistakeIds.includes(item.id));
       if (mistake) {
         const question: Question = { ...mistake, source: "mistake", mistakeId: mistake.id };
         return NextResponse.json({ question });
       }
-      const captured = getCapturedDrillQuestions(true).find((item) => !excludeCaptureIds.includes(item.captureId ?? 0));
+      const captured = getCapturedDrillQuestions(true, user.id).find((item) => !excludeCaptureIds.includes(item.captureId ?? 0));
       if (captured) return NextResponse.json({ question: captured });
     }
 
@@ -86,7 +88,7 @@ export async function POST(request: Request) {
           return { dimension, difficulty, focusSkills, paperPosition };
         });
       const useThinking = mode === "能力测评" && Boolean(body.thinking);
-      const questions = await generateQuestions(getSettings(), specs, true, previousQuestions, regenerateReason, { thinking: useThinking });
+      const questions = await generateQuestions(getSettings(user.id), specs, true, previousQuestions, regenerateReason, { thinking: useThinking });
       console.log("Generated question batch", { mode, count: specs.length, thinking: useThinking, specs, previousQuestions, regenerateReason });
       return NextResponse.json({ questions });
     }
@@ -103,17 +105,19 @@ export async function POST(request: Request) {
     const weakSkills = bodyFocusSkills.length
       ? bodyFocusSkills
       : mode === "专项训练"
-        ? getSkillAbilities()
+        ? getSkillAbilities(user.id)
           .filter((item) => item.dimension === dimension && item.evidence_count >= 1 && item.score < 70)
           .sort((a, b) => a.score - b.score || b.evidence_count - a.evidence_count)
           .map((item) => item.skill)
           .slice(0, 5)
         : [];
-    const question = await generateQuestion(getSettings(), dimension, difficulty, true, previousQuestions, regenerateReason, paperPosition, { thinking: useThinking, focusSkills: weakSkills });
+    const question = await generateQuestion(getSettings(user.id), dimension, difficulty, true, previousQuestions, regenerateReason, paperPosition, { thinking: useThinking, focusSkills: weakSkills });
     console.log("Prompt for question generation", { dimension, difficulty, thinking: useThinking, focusSkills: weakSkills, previousQuestions, regenerateReason, paperPosition });
     console.log("Generated question", { dimension, difficulty, thinking: useThinking, focusSkills: weakSkills, question });
     return NextResponse.json({ question });
   } catch (error) {
+    const authResponse = authErrorResponse(error);
+    if (authResponse) return authResponse;
     console.error("POST /api/question failed", error);
     return NextResponse.json({ message: error instanceof Error ? error.message : "题目生成失败" }, { status: 500 });
   }

@@ -10,7 +10,8 @@ A local web app for Chinese native speakers who want to practice Chinese-to-Engl
 - Mistake review that removes an item after two consecutive correct answers.
 - AI grading with verdicts, reference answers, error labels, explanations, and memory tips.
 - Progress dashboard with a radar chart, 30-day trend, error distribution, training records, and streak count.
-- Settings for LM Studio endpoint, model name, temperature, daily question count, assessment reset, and local data reset.
+- Local username/password accounts with invite-only registration and per-user training data.
+- Admin management for invites, users, password resets, and global LM Studio settings.
 
 ## Requirements
 
@@ -24,6 +25,13 @@ Install dependencies:
 
 ```bash
 npm install
+```
+
+Create the first admin account by setting these environment variables before the first run:
+
+```bash
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change-this-password
 ```
 
 Start the development server:
@@ -47,12 +55,12 @@ http://localhost:3000
 http://localhost:1234
 ```
 
-3. Open the app's Settings page and configure:
+3. Log in as an admin, then open the app's Settings page and configure:
 
 - LM Studio base URL, for example `http://localhost:1234`
 - Model name, matching the model loaded in LM Studio
 - Temperature, default `0.3`
-- Daily question count
+- Daily question count. This is a per-user preference; LM Studio connection settings are admin-only.
 
 4. Click the connection test button in Settings before starting an assessment or practice session.
 
@@ -64,7 +72,7 @@ The SQLite database is created automatically at:
 data/trainer.db
 ```
 
-Delete that file to manually clear local training data.
+Delete that file to manually clear all local users and training data. The in-app reset only clears the current user's training data.
 
 ## Available Scripts
 

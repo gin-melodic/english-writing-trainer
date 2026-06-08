@@ -12,14 +12,26 @@ const assert = require("node:assert/strict");
 
 const {
   addCapturedDrill,
+  addMistake,
   clearAllData,
+  createAuthSession,
+  createInvite,
+  createUser,
+  disableInvite,
   getAbilities,
   getCapturedDrillQuestions,
   getCapturedDrills,
   getHistory,
+  getInvites,
+  getMistakes,
+  getSessionUser,
+  getUserByUsername,
   initDb,
+  loginUser,
+  registerWithInvite,
   setAbility,
-  updateCapturedDrillStreak
+  updateCapturedDrillStreak,
+  verifyPassword
 } = require("../lib/db.ts");
 
 beforeEach(() => {
@@ -52,6 +64,81 @@ test("setAbility stores score and evidence count in current and history tables",
     score: 42.13,
     evidence_count: 3
   });
+});
+
+test("admin user is created from environment once", () => {
+  const oldUsername = process.env.ADMIN_USERNAME;
+  const oldPassword = process.env.ADMIN_PASSWORD;
+  process.env.ADMIN_USERNAME = "admin_test";
+  process.env.ADMIN_PASSWORD = "admin_password_123";
+  try {
+    initDb();
+    initDb();
+    const user = getUserByUsername("admin_test");
+
+    assert.equal(user.username, "admin_test");
+    assert.equal(user.role, "admin");
+  } finally {
+    if (oldUsername === undefined) delete process.env.ADMIN_USERNAME;
+    else process.env.ADMIN_USERNAME = oldUsername;
+    if (oldPassword === undefined) delete process.env.ADMIN_PASSWORD;
+    else process.env.ADMIN_PASSWORD = oldPassword;
+  }
+});
+
+test("password hashing verifies correct and incorrect passwords", () => {
+  const user = createUser({ username: "hash_user", password: "password_123" });
+
+  assert.equal(loginUser("hash_user", "password_123").id, user.id);
+  assert.throws(() => loginUser("hash_user", "wrong_password"), /用户名或密码错误/);
+  assert.equal(verifyPassword("password_123", "not-a-scrypt-hash"), false);
+});
+
+test("invite codes are one-time and disabled invites cannot register", () => {
+  const admin = createUser({ username: "invite_admin", password: "password_123", role: "admin" });
+  const invite = createInvite(admin.id);
+  const user = registerWithInvite("invited_user", "password_123", invite.code);
+
+  assert.equal(user.role, "user");
+  assert.throws(() => registerWithInvite("second_user", "password_123", invite.code), /邀请码无效或已使用/);
+
+  const disabled = createInvite(admin.id);
+  disableInvite(disabled.id);
+  assert.throws(() => registerWithInvite("blocked_user", "password_123", disabled.code), /邀请码无效或已使用/);
+  assert.ok(getInvites().some((item) => item.id === invite.id && item.used_by === user.id));
+});
+
+test("auth sessions resolve until deleted or user is disabled", () => {
+  const user = createUser({ username: "session_user", password: "password_123" });
+  const session = createAuthSession(user.id);
+
+  assert.equal(getSessionUser(session.token).username, "session_user");
+});
+
+test("training data is isolated by user id", () => {
+  const userA = createUser({ username: "isolated_a", password: "password_123" });
+  const userB = createUser({ username: "isolated_b", password: "password_123" });
+
+  setAbility("时态", 33, 2, userA.id);
+  setAbility("时态", 88, 4, userB.id);
+  addMistake({
+    chinese: "我昨天去了学校。",
+    answers: ["I went to school yesterday."],
+    vocabulary_tips: [],
+    grammar_focus: "一般过去时",
+    dimension: "时态",
+    skills: ["一般过去时"],
+    difficulty: 40,
+    error_types: ["tense"]
+  }, userA.id);
+  addCapturedDrill(sampleCard(), userB.id);
+
+  assert.equal(getAbilities(userA.id).find((item) => item.dimension === "时态").score, 33);
+  assert.equal(getAbilities(userB.id).find((item) => item.dimension === "时态").score, 88);
+  assert.equal(getMistakes(false, userA.id).length, 1);
+  assert.equal(getMistakes(false, userB.id).length, 0);
+  assert.equal(getCapturedDrills(false, userA.id).length, 0);
+  assert.equal(getCapturedDrills(false, userB.id).length, 1);
 });
 
 function sampleCard() {

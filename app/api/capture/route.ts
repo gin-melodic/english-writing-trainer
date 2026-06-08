@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { addCapturedDrill, getSettings, initDb } from "@/lib/db";
+import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateDrillCard } from "@/lib/llm";
 import { DIMENSIONS } from "@/lib/types";
 import type { DrillCard } from "@/lib/types";
@@ -42,30 +43,33 @@ function validateCard(value: unknown): DrillCard {
 export async function POST(request: Request) {
   try {
     initDb();
+    const user = requireUser(request);
     const body = await request.json();
     const action = String(body.action || "generate");
 
     if (action === "generate") {
       const sourceCn = validateSourceCn(body.source_cn);
-      const card = await generateDrillCard(getSettings(), sourceCn);
+      const card = await generateDrillCard(getSettings(user.id), sourceCn);
       return NextResponse.json({ card });
     }
 
     if (action === "save") {
       const card = validateCard(body.card);
-      const id = addCapturedDrill(card);
+      const id = addCapturedDrill(card, user.id);
       return NextResponse.json({ id, card });
     }
 
     if (action === "generate_and_save") {
       const sourceCn = validateSourceCn(body.source_cn);
-      const card = await generateDrillCard(getSettings(), sourceCn);
-      const id = addCapturedDrill(card);
+      const card = await generateDrillCard(getSettings(user.id), sourceCn);
+      const id = addCapturedDrill(card, user.id);
       return NextResponse.json({ id, card });
     }
 
     throw new ValidationError("未知 capture 操作");
   } catch (error) {
+    const authResponse = authErrorResponse(error);
+    if (authResponse) return authResponse;
     console.error("POST /api/capture failed", error);
     const status = error instanceof ValidationError ? 400 : 500;
     return NextResponse.json({ message: error instanceof Error ? error.message : "表达捕捉失败" }, { status });

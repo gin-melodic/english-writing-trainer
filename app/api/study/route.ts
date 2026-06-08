@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSettings, initDb } from "@/lib/db";
+import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateStudyGuide } from "@/lib/llm";
 import { DIMENSIONS, Dimension, Question } from "@/lib/types";
 
@@ -14,6 +15,7 @@ function toTextArray(value: unknown) {
 export async function POST(request: Request) {
   try {
     initDb();
+    const user = requireUser(request);
     const body = await request.json();
     const questions = Array.isArray(body.questions) ? body.questions as Partial<Question>[] : [];
     const outlines = questions
@@ -34,9 +36,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "缺少可用于生成学习内容的试卷知识点。" }, { status: 400 });
     }
 
-    const guide = await generateStudyGuide(getSettings(), outlines);
+    const guide = await generateStudyGuide(getSettings(user.id), outlines);
     return NextResponse.json({ guide });
   } catch (error) {
+    const authResponse = authErrorResponse(error);
+    if (authResponse) return authResponse;
     console.error("POST /api/study failed", error);
     return NextResponse.json({ message: error instanceof Error ? error.message : "学习内容生成失败" }, { status: 500 });
   }
