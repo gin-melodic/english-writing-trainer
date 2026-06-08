@@ -4,8 +4,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  assessmentEvidenceDetails,
   assessmentFindings,
+  calculateAssessmentSkillAbilityUpdates,
   calculateAssessmentMatrix,
+  calculatePracticeReport,
+  calculatePracticeAbilityUpdates,
+  calculatePracticeSkillAbilityUpdates,
   mergeAssessmentScore
 } = require("../lib/assessment.ts");
 
@@ -126,10 +131,375 @@ test("calculateAssessmentMatrix falls back to verdict score when dimension score
   assert.equal(matrix.find((item) => item.dimension === "时态").confidence, 0.11);
 });
 
+test("calculatePracticeReport produces objective daily summary with calibrated partial scores", () => {
+  const report = calculatePracticeReport([
+    record({
+      session_id: 9,
+      mode: "每日练习",
+      question_index: 0,
+      result: {
+        verdict: "partial",
+        error_types: ["tense"],
+        reference_answers: ["I finished my homework yesterday."],
+        differences: ["finish 应改为 finished。"],
+        explanations: ["过去时间 yesterday 要使用一般过去时。"],
+        dimension_scores: [
+          { dimension: "时态", score: 30, verdict: "partial", severity: "minor", notes: "时态形式不完整。" }
+        ],
+        skill_findings: ["一般过去时动词变化不稳定"]
+      }
+    }),
+    record({
+      session_id: 9,
+      mode: "每日练习",
+      question_index: 1,
+      question: {
+        chinese: "这本书在桌子上。",
+        answers: ["The book is on the table."],
+        grammar_focus: "介词 on",
+        dimension: "介词搭配",
+        difficulty: 50,
+        source: "ai"
+      },
+      user_answer: "The book is on the table.",
+      result: {
+        verdict: "correct",
+        error_types: [],
+        reference_answers: ["The book is on the table."],
+        differences: [],
+        explanations: ["表达正确"],
+        dimension_scores: [
+          { dimension: "介词搭配", score: 96, verdict: "correct", severity: "none", notes: "介词搭配正确。" }
+        ]
+      }
+    }),
+    record({
+      session_id: 9,
+      mode: "每日练习",
+      question_index: 2,
+      question: {
+        chinese: "我没有去上班，因为我感冒了。",
+        answers: ["I didn't go to work because I had a cold."],
+        grammar_focus: "because 从句",
+        dimension: "连接词",
+        difficulty: 60,
+        source: "ai"
+      },
+      user_answer: "I didn't go to work because of a cold.",
+      result: {
+        verdict: "wrong",
+        error_types: ["conjunction"],
+        reference_answers: ["I didn't go to work because I had a cold."],
+        differences: ["because of 后面不是完整从句。"],
+        explanations: ["本题要表达原因从句。"],
+        dimension_scores: [
+          { dimension: "连接词", score: 70, verdict: "wrong", severity: "major", notes: "没有使用 because 引导从句。" }
+        ]
+      }
+    })
+  ]);
+
+  assert.equal(report.session_id, 9);
+  assert.equal(report.total, 3);
+  assert.equal(report.correct, 1);
+  assert.equal(report.partial, 1);
+  assert.equal(report.wrong, 1);
+  assert.equal(report.accuracy, 33);
+  assert.equal(report.average_score, 62);
+  assert.equal(report.dimension_reports.find((item) => item.dimension === "时态").average_score, 45);
+  assert.equal(report.dimension_reports.find((item) => item.dimension === "连接词").average_score, 44);
+  assert.ok(report.weaknesses.some((item) => item.includes("连接词")));
+  assert.ok(report.recommendations.some((item) => item.includes("一般过去时动词变化不稳定")));
+});
+
 test("mergeAssessmentScore initializes directly and blends existing ability by confidence", () => {
   assert.equal(mergeAssessmentScore(0, 72, 0.5, true), 72);
   assert.equal(mergeAssessmentScore(50, 80, 0, false), 61);
   assert.equal(mergeAssessmentScore(50, 80, 1, false), 74);
+});
+
+test("calculatePracticeAbilityUpdates uses calibrated evidence instead of fixed point increments", () => {
+  const abilities = [
+    { dimension: "时态", score: 60 },
+    { dimension: "介词搭配", score: 50 },
+    { dimension: "定语从句", score: 50 },
+    { dimension: "连接词", score: 50 },
+    { dimension: "被动语态", score: 50 },
+    { dimension: "冠词", score: 50 }
+  ];
+  const updates = calculatePracticeAbilityUpdates(
+    abilities,
+    {
+      chinese: "这封信昨天被寄出了。",
+      answers: ["The letter was sent yesterday."],
+      grammar_focus: "一般过去时被动语态",
+      dimension: "被动语态",
+      secondary_dimensions: ["时态"],
+      difficulty: 80
+    },
+    {
+      verdict: "correct",
+      error_types: [],
+      reference_answers: ["The letter was sent yesterday."],
+      differences: [],
+      explanations: ["表达正确"],
+      dimension_scores: [
+        { dimension: "被动语态", score: 100, verdict: "correct", severity: "none", notes: "被动语态完整。" },
+        { dimension: "时态", score: 90, verdict: "correct", severity: "minor", notes: "过去时正确。" }
+      ]
+    },
+    "每日练习"
+  );
+
+  assert.deepEqual(updates, [
+    { dimension: "被动语态", score: 50.31, evidence_count: 1 },
+    { dimension: "时态", score: 60.15, evidence_count: 1 }
+  ]);
+});
+
+test("calculatePracticeAbilityUpdates starts uncovered dimensions from neutral evidence", () => {
+  const updates = calculatePracticeAbilityUpdates(
+    [],
+    {
+      chinese: "这本书在桌子上。",
+      answers: ["The book is on the table."],
+      grammar_focus: "介词 on",
+      dimension: "介词搭配",
+      difficulty: 30
+    },
+    {
+      verdict: "wrong",
+      error_types: ["preposition"],
+      reference_answers: ["The book is on the table."],
+      differences: ["缺少 on the table。"],
+      explanations: ["低难度介词结构未完成。"],
+      dimension_scores: [
+        { dimension: "介词搭配", score: 20, verdict: "wrong", severity: "major", notes: "介词结构错误。" }
+      ]
+    },
+    "每日练习"
+  );
+
+  assert.deepEqual(updates, [{ dimension: "介词搭配", score: 49.71, evidence_count: 1 }]);
+});
+
+test("calculatePracticeAbilityUpdates does not reward partial answers", () => {
+  const updates = calculatePracticeAbilityUpdates(
+    [{ dimension: "连接词", score: 35, evidence_count: 2 }],
+    {
+      chinese: "我因为感冒没有去上班。",
+      answers: ["I didn't go to work because I had a cold."],
+      grammar_focus: "because 引导原因状语从句",
+      dimension: "连接词",
+      secondary_dimensions: ["介词搭配", "冠词", "时态"],
+      difficulty: 60
+    },
+    {
+      verdict: "partial",
+      error_types: ["conjunction"],
+      reference_answers: ["I didn't go to work because I had a cold."],
+      differences: ["用户使用 because of 短语，没有使用 because 从句。"],
+      explanations: ["题目要求 because + 主谓结构。"],
+      dimension_scores: [
+        { dimension: "连接词", score: 70, verdict: "partial", severity: "major", notes: "未使用 because 引导原因状语从句。" }
+      ]
+    },
+    "每日练习"
+  );
+
+  assert.deepEqual(updates, [{ dimension: "连接词", score: 35, evidence_count: 3 }]);
+});
+
+test("calculatePracticeSkillAbilityUpdates updates primary and secondary skill evidence", () => {
+  const updates = calculatePracticeSkillAbilityUpdates(
+    [
+      { dimension: "被动语态", skill: "一般过去时被动结构", score: 50, evidence_count: 1, updated_at: "2026-05-28T00:00:00.000Z" },
+      { dimension: "时态", skill: "一般过去时被动结构", score: 60, evidence_count: 2, updated_at: "2026-05-28T00:00:00.000Z" }
+    ],
+    {
+      chinese: "这封信昨天被寄出了。",
+      answers: ["The letter was sent yesterday."],
+      grammar_focus: "一般过去时被动语态",
+      dimension: "被动语态",
+      secondary_dimensions: ["时态"],
+      skills: ["一般过去时被动结构", "be 动词时态变化"],
+      difficulty: 80
+    },
+    {
+      verdict: "wrong",
+      error_types: [],
+      reference_answers: ["The letter was sent yesterday."],
+      differences: ["漏掉被动结构。"],
+      explanations: ["应使用 was sent。"],
+      dimension_scores: [
+        { dimension: "被动语态", score: 20, verdict: "wrong", severity: "major", notes: "被动语态缺失。" },
+        { dimension: "时态", score: 75, verdict: "partial", severity: "minor", notes: "时间判断基本正确。" }
+      ],
+      skill_findings: ["一般过去时被动结构不稳定"]
+    },
+    "每日练习"
+  );
+
+  assert.deepEqual(updates.find((item) => item.dimension === "被动语态" && item.skill === "一般过去时被动结构"), {
+    dimension: "被动语态",
+    skill: "一般过去时被动结构",
+    score: 45.09,
+    evidence_count: 3
+  });
+  assert.deepEqual(updates.find((item) => item.dimension === "时态" && item.skill === "一般过去时被动结构"), {
+    dimension: "时态",
+    skill: "一般过去时被动结构",
+    score: 60,
+    evidence_count: 4
+  });
+});
+
+test("calculatePracticeSkillAbilityUpdates falls back to grammar focus when skills are absent", () => {
+  const updates = calculatePracticeSkillAbilityUpdates(
+    [],
+    {
+      chinese: "我昨天学习了。",
+      answers: ["I studied yesterday."],
+      grammar_focus: "一般过去时",
+      dimension: "时态",
+      difficulty: 40
+    },
+    {
+      verdict: "correct",
+      error_types: [],
+      reference_answers: ["I studied yesterday."],
+      differences: [],
+      explanations: ["表达正确"]
+    }
+  );
+
+  assert.deepEqual(updates, [{ dimension: "时态", skill: "一般过去时", score: 52.68, evidence_count: 1 }]);
+});
+
+test("calculateAssessmentSkillAbilityUpdates accumulates skill evidence across records", () => {
+  const updates = calculateAssessmentSkillAbilityUpdates([], [
+    record({
+      question: {
+        chinese: "昨天我完成了作业。",
+        answers: ["I finished my homework yesterday."],
+        grammar_focus: "一般过去时",
+        dimension: "时态",
+        skills: ["过去式动词"],
+        difficulty: 50,
+        source: "ai"
+      },
+      result: {
+        verdict: "wrong",
+        error_types: [],
+        reference_answers: ["I finished my homework yesterday."],
+        differences: [],
+        explanations: ["时态错误"],
+        dimension_scores: [
+          { dimension: "时态", score: 20, verdict: "wrong", severity: "major", notes: "没有使用过去式" }
+        ]
+      }
+    }),
+    record({
+      question_index: 1,
+      question: {
+        chinese: "他昨晚打电话给我。",
+        answers: ["He called me last night."],
+        grammar_focus: "一般过去时",
+        dimension: "时态",
+        skills: ["过去式动词"],
+        difficulty: 50,
+        source: "ai"
+      },
+      result: {
+        verdict: "correct",
+        error_types: [],
+        reference_answers: ["He called me last night."],
+        differences: [],
+        explanations: ["表达正确"],
+        dimension_scores: [
+          { dimension: "时态", score: 100, verdict: "correct", severity: "none", notes: "过去式正确" }
+        ]
+      }
+    })
+  ]);
+
+  assert.deepEqual(updates, [{ dimension: "时态", skill: "过去式动词", score: 50.74, evidence_count: 2 }]);
+});
+
+test("calculatePracticeAbilityUpdates does not reward easy correct answers for already high ability", () => {
+  const updates = calculatePracticeAbilityUpdates(
+    [{ dimension: "时态", score: 90 }],
+    {
+      chinese: "我昨天学习了。",
+      answers: ["I studied yesterday."],
+      grammar_focus: "一般过去时",
+      dimension: "时态",
+      difficulty: 35
+    },
+    {
+      verdict: "correct",
+      error_types: [],
+      reference_answers: ["I studied yesterday."],
+      differences: [],
+      explanations: ["表达正确"],
+      dimension_scores: [
+        { dimension: "时态", score: 100, verdict: "correct", severity: "none", notes: "过去式正确。" }
+      ]
+    }
+  );
+
+  assert.deepEqual(updates, [{ dimension: "时态", score: 90, evidence_count: 1 }]);
+});
+
+test("calculatePracticeAbilityUpdates avoids raising low ability after a hard wrong answer", () => {
+  const updates = calculatePracticeAbilityUpdates(
+    [{ dimension: "定语从句", score: 30 }],
+    {
+      chinese: "我喜欢昨天买的那本书。",
+      answers: ["I like the book that I bought yesterday."],
+      grammar_focus: "定语从句",
+      dimension: "定语从句",
+      difficulty: 85
+    },
+    {
+      verdict: "wrong",
+      error_types: ["relative_clause"],
+      reference_answers: ["I like the book that I bought yesterday."],
+      differences: ["缺少定语从句。"],
+      explanations: ["没有写出 that I bought yesterday。"],
+      dimension_scores: [
+        { dimension: "定语从句", score: 20, verdict: "wrong", severity: "major", notes: "目标结构缺失。" }
+      ]
+    }
+  );
+
+  assert.deepEqual(updates, [{ dimension: "定语从句", score: 30, evidence_count: 1 }]);
+});
+
+test("calculatePracticeAbilityUpdates weighs mistake review lower than daily practice", () => {
+  const question = {
+    chinese: "这封信昨天被寄出了。",
+    answers: ["The letter was sent yesterday."],
+    grammar_focus: "一般过去时被动语态",
+    dimension: "被动语态",
+    difficulty: 35
+  };
+  const result = {
+    verdict: "wrong",
+    error_types: ["passive_voice"],
+    reference_answers: ["The letter was sent yesterday."],
+    differences: ["缺少被动语态。"],
+    explanations: ["应使用 was sent。"],
+    dimension_scores: [
+      { dimension: "被动语态", score: 20, verdict: "wrong", severity: "major", notes: "被动语态缺失。" }
+    ]
+  };
+  const daily = calculatePracticeAbilityUpdates([{ dimension: "被动语态", score: 70, evidence_count: 4 }], question, result, "每日练习")[0];
+  const review = calculatePracticeAbilityUpdates([{ dimension: "被动语态", score: 70, evidence_count: 4 }], { ...question, source: "mistake" }, result, "错题重练")[0];
+
+  assert.ok(daily.score < review.score);
+  assert.equal(daily.evidence_count, 5);
+  assert.equal(review.evidence_count, 5);
 });
 
 test("assessmentFindings includes dimension notes and skill findings with question position", () => {
@@ -154,6 +524,58 @@ test("assessmentFindings includes dimension notes and skill findings with questi
     "第 3 题 时态 - 时态:partial/45 过去式遗漏",
     "第 3 题 时态 - 时间状语 yesterday 与动词形式不匹配"
   ]);
+});
+
+test("assessmentEvidenceDetails keeps structured per-question diagnosis fields", () => {
+  const details = assessmentEvidenceDetails([
+    record({
+      question_index: 2,
+      question: {
+        chinese: "昨天我完成了作业。",
+        answers: ["I finished my homework yesterday."],
+        grammar_focus: "一般过去时",
+        dimension: "时态",
+        secondary_dimensions: ["冠词"],
+        skills: ["过去式动词"],
+        rubric_points: ["动词必须使用过去式"],
+        difficulty: 50,
+        source: "ai"
+      },
+      user_answer: "I finish my homework yesterday.",
+      result: {
+        verdict: "partial",
+        error_types: ["tense"],
+        reference_answers: ["I finished my homework yesterday."],
+        differences: ["finish 应改为 finished。"],
+        explanations: ["yesterday 表示过去时间，动词需要用过去式。"],
+        dimension_scores: [
+          { dimension: "时态", score: 45, verdict: "partial", severity: "major", notes: "过去式遗漏" }
+        ],
+        skill_findings: ["时间状语 yesterday 与动词形式不匹配"]
+      }
+    })
+  ]);
+
+  assert.deepEqual(details[0], {
+    question_index: 3,
+    dimension: "时态",
+    secondary_dimensions: ["冠词"],
+    difficulty: 50,
+    grammar_focus: "一般过去时",
+    skills: ["过去式动词"],
+    rubric_points: ["动词必须使用过去式"],
+    chinese: "昨天我完成了作业。",
+    user_answer: "I finish my homework yesterday.",
+    reference_answer: "I finished my homework yesterday.",
+    verdict: "partial",
+    error_types: ["tense"],
+    dimension_scores: [
+      { dimension: "时态", score: 45, verdict: "partial", severity: "major", notes: "过去式遗漏" }
+    ],
+    differences: ["finish 应改为 finished。"],
+    explanations: ["yesterday 表示过去时间，动词需要用过去式。"],
+    skill_findings: ["时间状语 yesterday 与动词形式不匹配"]
+  });
 });
 
 test("calculateAssessmentMatrix stays high when normalized correct evidence is high", () => {

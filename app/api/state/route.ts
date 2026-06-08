@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAbilities, getAssessmentReportCount, getAssessmentReports, getHistory, getLatestAssessmentReportCreatedAt, getMistakes, getRecords, getSettings, getStreak, initDb } from "@/lib/db";
+import { getAbilities, getAssessmentReportCount, getAssessmentReports, getCapturedDrills, getHistory, getLatestAssessmentReportCreatedAt, getLatestPracticeReport, getMistakes, getRecords, getSettings, getSkillAbilities, getStreak, initDb } from "@/lib/db";
 
 function clampInt(value: string | null, fallback: number, min: number, max: number) {
   const parsed = Number(value);
@@ -17,12 +17,18 @@ export async function GET(request: Request) {
   const assessmentOffset = (assessmentReportPage - 1) * assessmentPageSize;
   const latestAssessmentReport = getAssessmentReports(1, 0)[0] ?? null;
   const abilities = getAbilities();
+  const capturedDrills = getCapturedDrills(false);
   return NextResponse.json({
     settings: getSettings(),
     abilities,
+    skillAbilities: getSkillAbilities(),
     history: getHistory(),
     mistakes: getMistakes(false),
+    capturedDrills,
+    capturedDrillCount: capturedDrills.length,
+    activeCapturedDrillCount: capturedDrills.filter((item) => item.correct_streak < 2).length,
     records: getRecords(),
+    latestPracticeReport: getLatestPracticeReport("每日练习"),
     assessmentReports: getAssessmentReports(assessmentPageSize, assessmentOffset),
     assessmentReportPage,
     assessmentReportPageSize: assessmentPageSize,
@@ -31,6 +37,6 @@ export async function GET(request: Request) {
     latestAssessmentReport,
     latestAssessmentAt: getLatestAssessmentReportCreatedAt(),
     streak: getStreak(),
-    needsAssessment: abilities.every((item) => item.score === 0)
+    needsAssessment: abilities.every((item) => item.evidence_count === 0)
   });
 }

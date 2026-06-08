@@ -1,13 +1,9 @@
 import { NextResponse } from "next/server";
-import { addMistake, getAbilities, getSettings, initDb, recordQuestionAnswer, setAbility, updateMistakeStreak, updateSession } from "@/lib/db";
+import { calculatePracticeAbilityUpdates, calculatePracticeSkillAbilityUpdates } from "@/lib/assessment";
+import { addMistake, getAbilities, getSettings, getSkillAbilities, initDb, recordQuestionAnswer, setAbility, setSkillAbility, updateCapturedDrillStreak, updateMistakeStreak, updateSession } from "@/lib/db";
 import { gradeAnswer } from "@/lib/llm";
+import { publicQuestionSkills } from "@/lib/questionSafety";
 import { Question } from "@/lib/types";
-
-function abilityDelta(verdict: string, difficulty: number) {
-  if (verdict === "correct") return difficulty >= 70 ? 5 : difficulty >= 45 ? 4 : 2;
-  if (verdict === "partial") return 1;
-  return difficulty >= 70 ? -1 : difficulty >= 45 ? -2 : -3;
-}
 
 export async function POST(request: Request) {
   try {
@@ -20,7 +16,8 @@ export async function POST(request: Request) {
       questionIndex?: number;
       durationSeconds?: number;
     };
-    const result = await gradeAnswer(getSettings(), question, answer);
+    const safeQuestion: Question = { ...question, skills: publicQuestionSkills(question.skills) };
+    const result = await gradeAnswer(getSettings(), safeQuestion, answer);
     const correct = result.verdict === "correct";
     const normalizedMode = String(mode || "每日练习");
 
@@ -29,7 +26,7 @@ export async function POST(request: Request) {
         sessionId,
         mode: normalizedMode,
         questionIndex: Number.isFinite(Number(questionIndex)) ? Number(questionIndex) : 0,
-        question,
+        question: safeQuestion,
         userAnswer: answer,
         result,
         durationSeconds
@@ -38,28 +35,38 @@ export async function POST(request: Request) {
 
     if (normalizedMode === "能力测评") {
       if (sessionId) updateSession(sessionId, correct);
-      return NextResponse.json({ result, abilities: getAbilities() });
+      return NextResponse.json({ result, abilities: getAbilities(), skillAbilities: getSkillAbilities() });
     }
 
     const abilities = getAbilities();
-    const current = abilities.find((item) => item.dimension === question.dimension)?.score ?? 0;
-    setAbility(question.dimension, current + abilityDelta(result.verdict, question.difficulty));
+    for (const update of calculatePracticeAbilityUpdates(abilities, safeQuestion, result, normalizedMode)) {
+      setAbility(update.dimension, update.score, update.evidence_count);
+    }
+    for (const update of calculatePracticeSkillAbilityUpdates(getSkillAbilities(), safeQuestion, result, normalizedMode)) {
+      setSkillAbility(update);
+    }
 
-    if (question.source === "mistake" && question.mistakeId) {
-      updateMistakeStreak(question.mistakeId, correct);
+    if (safeQuestion.origin === "user_capture" && safeQuestion.captureId) {
+      updateCapturedDrillStreak(safeQuestion.captureId, correct);
+    }
+
+    if (safeQuestion.source === "mistake" && safeQuestion.mistakeId) {
+      updateMistakeStreak(safeQuestion.mistakeId, correct);
     } else if (!correct) {
       addMistake({
-        chinese: question.chinese,
-        answers: result.reference_answers?.length ? result.reference_answers : question.answers,
-        grammar_focus: question.grammar_focus,
-        dimension: question.dimension,
-        difficulty: question.difficulty,
+        chinese: safeQuestion.chinese,
+        answers: result.reference_answers?.length ? result.reference_answers : safeQuestion.answers,
+        vocabulary_tips: safeQuestion.vocabulary_tips ?? [],
+        grammar_focus: safeQuestion.grammar_focus,
+        dimension: safeQuestion.dimension,
+        skills: safeQuestion.skills ?? [],
+        difficulty: safeQuestion.difficulty,
         error_types: result.error_types ?? []
       });
     }
 
     if (sessionId) updateSession(sessionId, correct);
-    return NextResponse.json({ result, abilities: getAbilities() });
+    return NextResponse.json({ result, abilities: getAbilities(), skillAbilities: getSkillAbilities() });
   } catch (error) {
     console.error("POST /api/grade failed", error);
     return NextResponse.json({ message: error instanceof Error ? error.message : "批改失败" }, { status: 500 });

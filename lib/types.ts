@@ -13,6 +13,15 @@ export type Settings = {
 export type Ability = {
   dimension: Dimension;
   score: number;
+  evidence_count: number;
+};
+
+export type SkillAbility = {
+  dimension: Dimension;
+  skill: string;
+  score: number;
+  evidence_count: number;
+  updated_at: string;
 };
 
 export type Question = {
@@ -27,7 +36,29 @@ export type Question = {
   rubric_points?: string[];
   difficulty: number;
   source?: "ai" | "mistake";
+  origin?: "ai" | "mistake" | "user_capture";
   mistakeId?: number;
+  captureId?: number;
+};
+
+export type DrillCard = {
+  casual: string;
+  standard: string;
+  vivid: string;
+  source_cn: string;
+  reference_en: string;
+  grammar_dimension: Dimension;
+  common_mistake: string;
+  memory_hook: string;
+};
+
+export type CapturedDrill = DrillCard & {
+  id: number;
+  origin: "user_capture";
+  difficulty: number;
+  correct_streak: number;
+  created_at: string;
+  updated_at: string;
 };
 
 export type StudyGuideSection = {
@@ -71,12 +102,19 @@ export type GradeResult = {
   skill_findings?: string[];
 };
 
+export type FollowUpMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
 export type Mistake = {
   id: number;
   chinese: string;
   answers: string[];
+  vocabulary_tips?: string[];
   grammar_focus: string;
   dimension: Dimension;
+  skills?: string[];
   difficulty: number;
   error_types: string[];
   correct_streak: number;
@@ -92,10 +130,40 @@ export type TrainingRecord = {
   accuracy: number;
 };
 
+export type PracticeDimensionReport = {
+  dimension: Dimension;
+  total: number;
+  correct: number;
+  partial: number;
+  wrong: number;
+  accuracy: number;
+  average_score: number;
+  evidence_count: number;
+  notes: string[];
+};
+
+export type PracticeReport = {
+  session_id: number;
+  date: string;
+  mode: string;
+  total: number;
+  correct: number;
+  partial: number;
+  wrong: number;
+  accuracy: number;
+  average_score: number;
+  average_duration_seconds: number;
+  dimension_reports: PracticeDimensionReport[];
+  strengths: string[];
+  weaknesses: string[];
+  recommendations: string[];
+};
+
 export type AbilityHistory = {
   date: string;
   dimension: Dimension;
   score: number;
+  evidence_count: number;
 };
 
 export type QuestionAnswerRecord = {

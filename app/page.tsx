@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, RotateCcw, Settings as SettingsIcon, Target, Trash2, X } from "lucide-react";
-import { Ability, AbilityHistory, AssessmentReport, DIMENSIONS, Dimension, GradeResult, Mistake, Question, Settings, StudyGuide, TrainingRecord } from "@/lib/types";
+import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, MessageCircle, MessageSquarePlus, RotateCcw, Send, Settings as SettingsIcon, Target, Trash2, X } from "lucide-react";
+import AbilityMotionField from "./AbilityMotionField";
+import { publicQuestionSkills } from "@/lib/questionSafety";
+import { Ability, AbilityHistory, AssessmentReport, CapturedDrill, DIMENSIONS, Dimension, DrillCard, FollowUpMessage, GradeResult, Mistake, PracticeReport, Question, Settings, SkillAbility, StudyGuide, TrainingRecord } from "@/lib/types";
 
 type View = "能力测评" | "每日练习" | "专项训练" | "错题重练" | "数据统计" | "设置";
 type TrainingMode = "能力测评" | "每日练习" | "专项训练" | "错题重练";
@@ -55,13 +57,52 @@ type AssessmentFinalizeEvent = {
   message?: string;
   report?: AssessmentReport;
   abilities?: Ability[];
+  skillAbilities?: SkillAbility[];
+};
+type ConnectionTestItem = {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+};
+type ConnectionTestResult = {
+  models: unknown[];
+  modelFound: boolean | null;
+  tests: ConnectionTestItem[];
+};
+type ConnectionTestResponse = ConnectionTestResult & {
+  ok: boolean;
+  message?: string;
+  result?: ConnectionTestResult;
+};
+type CaptureResponse = {
+  id?: number;
+  card: DrillCard;
+};
+type CaptureState = {
+  open: boolean;
+  sourceCn: string;
+  card?: DrillCard;
+  loading: string;
+  error: string;
+  saved: boolean;
+};
+type QuestionResponse = {
+  question?: Question;
+  questions?: Question[];
+  done?: boolean;
 };
 type AppState = {
   settings: Settings;
   abilities: Ability[];
+  skillAbilities: SkillAbility[];
   history: AbilityHistory[];
   mistakes: Mistake[];
+  capturedDrills: CapturedDrill[];
+  capturedDrillCount: number;
+  activeCapturedDrillCount: number;
   records: TrainingRecord[];
+  latestPracticeReport: PracticeReport | null;
   assessmentReports: AssessmentReport[];
   assessmentReportPage: number;
   assessmentReportPageSize: number;
@@ -75,10 +116,15 @@ type AppState = {
 
 const emptyState: AppState = {
   settings: { baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20, maxConcurrentPredictions: 5 },
-  abilities: DIMENSIONS.map((dimension) => ({ dimension, score: 0 })),
+  abilities: DIMENSIONS.map((dimension) => ({ dimension, score: 50, evidence_count: 0 })),
+  skillAbilities: [],
   history: [],
   mistakes: [],
+  capturedDrills: [],
+  capturedDrillCount: 0,
+  activeCapturedDrillCount: 0,
   records: [],
+  latestPracticeReport: null,
   assessmentReports: [],
   assessmentReportPage: 1,
   assessmentReportPageSize: 10,
@@ -99,8 +145,9 @@ const navItems: Array<{ name: View; icon: React.ReactNode }> = [
   { name: "设置", icon: <SettingsIcon size={18} /> }
 ];
 
-const ASSESSMENT_MIN = 18;
-const ASSESSMENT_MAX = 30;
+const ASSESSMENT_MIN = 12;
+const ASSESSMENT_MAX = 18;
+const ASSESSMENT_MIN_WEIGHTED_EVIDENCE = 2.2;
 const ASSESSMENT_INPUT_MIN = 1;
 const ASSESSMENT_INPUT_MAX = 60;
 const DEFAULT_ASSESSMENT_OPTIONS: AssessmentOptions = {
@@ -216,7 +263,7 @@ function verdictText(verdict: GradeResult["verdict"]) {
 
 function verdictScore(verdict: GradeResult["verdict"]) {
   if (verdict === "correct") return 100;
-  if (verdict === "partial") return 60;
+  if (verdict === "partial") return 40;
   return 20;
 }
 
@@ -263,9 +310,9 @@ function assessmentExtensionCandidates(questions: Question[], answerRecords: Rec
       });
     });
     const score = totalWeight ? weighted / totalWeight : 0;
-    const uncertain = evidence < 5 || (score >= 45 && score <= 75 && mixed);
+    const uncertain = totalWeight < ASSESSMENT_MIN_WEIGHTED_EVIDENCE || (score >= 45 && score <= 75 && mixed);
     const weak = score > 0 && score < 70;
-    return { dimension, score, evidence, uncertain, weak };
+    return { dimension, score, evidence, weightedEvidence: totalWeight, uncertain, weak };
   })
     .filter((item) => item.weak || item.uncertain)
     .sort((a, b) => {
@@ -285,7 +332,7 @@ function buildAssessmentExtensionPlan(questions: Question[], answerRecords: Reco
     const target = candidates[index % candidates.length];
     const reasons = [
       target.weak ? `当前估算分 ${Math.round(target.score)}，低于稳定掌握线 70。` : "",
-      target.uncertain ? `有效证据 ${target.evidence} 条，仍不足以稳定判断该维度。` : "",
+      target.uncertain ? `加权证据 ${target.weightedEvidence.toFixed(1)}，仍不足以稳定判断该维度。` : "",
       target.score >= 45 && target.score <= 75 ? "表现处在临界区间，需要更多题目区分偶然失误和真实薄弱点。" : ""
     ].filter(Boolean);
     return {
@@ -309,6 +356,25 @@ function elapsedText(dateText?: string | null) {
   if (hours < 24) return `距离上次测评 ${hours} 小时`;
   const days = Math.floor(hours / 24);
   return `距离上次测评 ${days} 天`;
+}
+
+function formatAbilityScore(score: number) {
+  return score.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function abilityScoreLabel(ability: Ability) {
+  return ability.evidence_count > 0 ? formatAbilityScore(ability.score) : "待测";
+}
+
+function abilityEvidenceLabel(ability: Ability) {
+  return ability.evidence_count > 0 ? `证据 ${ability.evidence_count}` : "证据不足";
+}
+
+function weakSkillsForDimension(skillAbilities: SkillAbility[], dimension: Dimension, limit = 5) {
+  return skillAbilities
+    .filter((item) => item.dimension === dimension && item.evidence_count > 0 && item.score < 70)
+    .sort((a, b) => a.score - b.score || b.evidence_count - a.evidence_count)
+    .slice(0, limit);
 }
 
 function Radar({ abilities, onPick }: { abilities: Ability[]; onPick?: (dimension: Dimension) => void }) {
@@ -354,7 +420,41 @@ function Radar({ abilities, onPick }: { abilities: Ability[]; onPick?: (dimensio
   );
 }
 
-function Feedback({ result }: { result: GradeResult }) {
+function Feedback({ question, userAnswer, result }: { question: Question; userAnswer: string; result: GradeResult }) {
+  const [messages, setMessages] = useState<FollowUpMessage[]>([]);
+  const [prompt, setPrompt] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function askFollowUp() {
+    const nextPrompt = prompt.trim();
+    if (!nextPrompt || loading) return;
+    const nextMessages: FollowUpMessage[] = [...messages, { role: "user", content: nextPrompt }];
+    setMessages(nextMessages);
+    setPrompt("");
+    setError("");
+    setLoading(true);
+    try {
+      const data = await api<{ answer: string }>("/api/followup", {
+        method: "POST",
+        body: JSON.stringify({
+          question,
+          userAnswer,
+          result,
+          messages,
+          prompt: nextPrompt
+        })
+      });
+      setMessages([...nextMessages, { role: "assistant", content: data.answer }]);
+    } catch (err) {
+      setMessages(messages);
+      setPrompt(nextPrompt);
+      setError(errorMessage(err, "追问失败"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <div className="feedback feedback-grid">
       <div className={`verdict ${result.verdict}`}>{verdictText(result.verdict)}</div>
@@ -372,7 +472,50 @@ function Feedback({ result }: { result: GradeResult }) {
           {result.explanations.map((item, index) => <p key={`e-${index}`}>{index + 1}. {item}</p>)}
         </div>
       )}
+      {(Boolean(question.skills?.length) || Boolean(result.skill_findings?.length)) && (
+        <div className="skill-feedback">
+          {Boolean(question.skills?.length) && (
+            <div>
+              <strong>本题技能</strong>
+              <div>{question.skills?.map((item) => <span className="tag skill-tag" key={item}>{item}</span>)}</div>
+            </div>
+          )}
+          {Boolean(result.skill_findings?.length) && (
+            <div>
+              <strong>技能诊断</strong>
+              <div>{result.skill_findings?.map((item) => <span className="tag finding-tag" key={item}>{item}</span>)}</div>
+            </div>
+          )}
+        </div>
+      )}
       {result.memory_tip && <div><strong>记忆技巧</strong><p>{result.memory_tip}</p></div>}
+      <div className="followup-panel">
+        <div className="followup-title"><MessageCircle size={17} /><strong>继续追问</strong></div>
+        {messages.length > 0 && (
+          <div className="followup-thread">
+            {messages.map((message, index) => (
+              <div className={`followup-message ${message.role}`} key={`${message.role}-${index}`}>
+                <span>{message.role === "user" ? "我" : "LLM"}</span>
+                <p>{message.content}</p>
+              </div>
+            ))}
+          </div>
+        )}
+        <textarea
+          className="followup-input"
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          placeholder="例如：为什么这里不能用现在完成时？"
+          disabled={loading}
+        />
+        {error && <div className="notice compact">{error}</div>}
+        <div className="actions">
+          <button className="primary icon-button-text" onClick={askFollowUp} disabled={loading || !prompt.trim()}>
+            <Send size={16} />
+            {loading ? "追问中…" : "追问"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -403,6 +546,13 @@ export default function Home() {
   const [assessmentReportPageSize] = useState(10);
   const [trendDimension, setTrendDimension] = useState<Dimension>("时态");
   const [questionStartedAt, setQuestionStartedAt] = useState(Date.now());
+  const [capture, setCapture] = useState<CaptureState>({
+    open: false,
+    sourceCn: "",
+    loading: "",
+    error: "",
+    saved: false
+  });
 
   const refresh = useCallback(async () => {
     const params = new URLSearchParams({
@@ -473,6 +623,28 @@ export default function Home() {
     }
 
     if (nextMode === "每日练习") {
+      questions.push(...state.capturedDrills
+        .filter((item) => item.correct_streak < 2)
+        .slice(0, nextTotal)
+        .map((item) => ({
+          chinese: item.source_cn,
+          answers: [item.reference_en],
+          grammar_focus: item.common_mistake,
+          dimension: item.grammar_dimension,
+          skills: item.common_mistake ? [item.common_mistake] : [],
+          rubric_points: [
+            `自然口语：${item.casual}`,
+            `标准表达：${item.standard}`,
+            `生动表达：${item.vivid}`,
+            `记忆钩子：${item.memory_hook}`
+          ],
+          difficulty: item.difficulty,
+          origin: "user_capture",
+          captureId: item.id
+        }) satisfies Question));
+      if (questions.length > 0) {
+        setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已加入 ${questions.length} 张快速捕捉卡，正在补齐本次练习试卷。`);
+      }
       // 每日练习包含错题
       // questions.push(...activeMistakes.slice(0, nextTotal).map((mistake) => ({ ...mistake, source: "mistake", mistakeId: mistake.id }) satisfies Question));
       // if (questions.length > 0) {
@@ -481,43 +653,38 @@ export default function Home() {
     }
 
     const aiTotal = nextTotal - questions.length;
-    const concurrency = Math.min(aiTotal, Math.max(1, Math.floor(Number(state.settings.maxConcurrentPredictions) || 1)));
-    for (let start = 0; start < aiTotal; start += concurrency) {
-      const chunkSize = Math.min(concurrency, aiTotal - start);
-      const from = questions.length + 1;
-      const to = questions.length + chunkSize;
-      setLoading(chunkSize > 1 ? `AI 正在并发生成题目 ${from}-${to}/${nextTotal}…` : `AI 正在生成题目 ${from}/${nextTotal}…`);
-      setPaperGenerationProgress(
-        nextMode,
-        questions.length,
-        nextTotal,
-        chunkSize > 1 ? `AI 正在并发生成第 ${from}-${to} 题。` : `AI 正在生成第 ${from} 题。`
-      );
-      const previousQuestions = questions.map((question) => question.chinese);
-      const results = await Promise.all(Array.from({ length: chunkSize }, async (_, offset) => {
-        const index = questions.length + offset;
-        const nextAssessmentStep = assessmentStepAt(index);
-        const dimension = nextMode === "能力测评" ? nextAssessmentStep.dimension : nextMode === "专项训练" ? specialDimension : undefined;
-        const difficulty = nextMode === "能力测评" ? nextAssessmentStep.difficulty : undefined;
-        return api<{ question?: Question; done?: boolean }>("/api/question", {
-          method: "POST",
-          body: JSON.stringify({
-            mode: nextMode,
-            dimension,
-            difficulty,
-            previousQuestions,
-            batchIndex: index + 1,
-            batchTotal: nextTotal,
-            forceAi: true
-          })
-        });
-      }));
-      for (const data of results) {
-        if (data.done || !data.question) return questions;
-        questions.push(data.question);
-      }
-      setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已生成 ${questions.length}/${nextTotal} 题，正在继续准备试卷。`);
-    }
+    if (aiTotal < 1) return questions;
+    const from = questions.length + 1;
+    const to = nextTotal;
+    setLoading(`AI 正在一次性生成题目 ${from}-${to}/${nextTotal}…`);
+    setPaperGenerationProgress(nextMode, questions.length, nextTotal, `AI 正在一次性规划并生成第 ${from}-${to} 题，避免题目重复。`);
+    const previousQuestions = questions.map((question) => question.chinese);
+    const specs = Array.from({ length: aiTotal }, (_, offset) => {
+      const index = questions.length + offset;
+      const nextAssessmentStep = assessmentStepAt(index);
+      const dimension = nextMode === "能力测评" ? nextAssessmentStep.dimension : nextMode === "专项训练" ? specialDimension : undefined;
+      const difficulty = nextMode === "能力测评" ? nextAssessmentStep.difficulty : undefined;
+      const focusSkills = dimension ? weakSkillsForDimension(state.skillAbilities, dimension).map((item) => item.skill) : [];
+      return {
+        dimension,
+        difficulty,
+        focusSkills,
+        batchIndex: index + 1,
+        batchTotal: nextTotal
+      };
+    });
+    const data = await api<QuestionResponse>("/api/question", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: nextMode,
+        questions: specs,
+        previousQuestions,
+        forceAi: true
+      })
+    });
+    if (data.done) return questions;
+    questions.push(...(data.questions ?? (data.question ? [data.question] : [])));
+    setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已生成 ${questions.length}/${nextTotal} 题。`);
     return questions;
   }
 
@@ -574,12 +741,13 @@ export default function Home() {
     setPaperNotes((prev) => ({ ...prev, [index]: { ...prev[index], loading: true } }));
     try {
       const previousQuestions = questionQueue.map((item, itemIndex) => itemIndex === index ? "" : item.chinese).filter(Boolean);
-      const data = await api<{ question?: Question; done?: boolean }>("/api/question", {
+      const data = await api<QuestionResponse>("/api/question", {
         method: "POST",
         body: JSON.stringify({
           mode: activeMode,
           dimension: current.dimension,
           difficulty: current.difficulty,
+          focusSkills: activeMode === "专项训练" ? weakSkillsForDimension(state.skillAbilities, current.dimension).map((item) => item.skill) : [],
           previousQuestions,
           excludeMistakeIds: questionQueue.map((item) => item.mistakeId).filter((id): id is number => typeof id === "number"),
           regenerateReason: paperNotes[index]?.reason ?? "",
@@ -689,7 +857,7 @@ export default function Home() {
       });
     }
     try {
-      const data = await api<{ result: GradeResult; abilities: Ability[] }>("/api/grade", {
+      const data = await api<{ result: GradeResult; abilities: Ability[]; skillAbilities: SkillAbility[] }>("/api/grade", {
         method: "POST",
         body: JSON.stringify({
           question: activeQuestion,
@@ -705,7 +873,7 @@ export default function Home() {
         [progress.current]: { answer: activeRecord.answer, result: data.result }
       };
       setAnswerRecords(nextAnswerRecords);
-      setState((prev) => ({ ...prev, abilities: data.abilities }));
+      setState((prev) => ({ ...prev, abilities: data.abilities, skillAbilities: data.skillAbilities ?? prev.skillAbilities }));
       if (isAssessmentSubmit) {
         setAssessmentProgress({
           title: "正在规划后续流程",
@@ -737,28 +905,24 @@ export default function Home() {
     setError("");
     const extensionQuestions: Question[] = [];
     try {
-      const concurrency = Math.min(plan.length, Math.max(1, Math.floor(Number(state.settings.maxConcurrentPredictions) || 1)));
-      for (let start = 0; start < plan.length; start += concurrency) {
-        const chunk = plan.slice(start, start + concurrency);
-        setLoading(`AI 正在一次性生成扩展题 ${start + 1}-${start + chunk.length}/${plan.length}…`);
-        const previousQuestions = [...questionQueue, ...extensionQuestions].map((item) => item.chinese);
-        const results = await Promise.all(chunk.map((item, offset) => api<{ question?: Question; done?: boolean }>("/api/question", {
-          method: "POST",
-          body: JSON.stringify({
-            mode: activeMode,
+      setLoading(`AI 正在一次性生成扩展题 1-${plan.length}/${plan.length}…`);
+      const previousQuestions = questionQueue.map((item) => item.chinese);
+      const data = await api<QuestionResponse>("/api/question", {
+        method: "POST",
+        body: JSON.stringify({
+          mode: activeMode,
+          questions: plan.map((item, offset) => ({
             dimension: item.dimension,
             difficulty: item.difficulty,
-            previousQuestions,
-            batchIndex: questionQueue.length + start + offset + 1,
-            batchTotal: questionQueue.length + plan.length,
-            forceAi: true,
-            thinking: true
-          })
-        })));
-        results.forEach((data) => {
-          if (data.question && !data.done) extensionQuestions.push(data.question);
-        });
-      }
+            batchIndex: questionQueue.length + offset + 1,
+            batchTotal: questionQueue.length + plan.length
+          })),
+          previousQuestions,
+          forceAi: true,
+          thinking: true
+        })
+      });
+      extensionQuestions.push(...(data.questions ?? (data.question ? [data.question] : [])));
       if (extensionQuestions.length < 1) {
         setError("扩展题生成失败，请稍后重试。");
         return;
@@ -819,7 +983,13 @@ export default function Home() {
       });
       if (event === "done") {
         completed = true;
-        if (data.abilities) setState((prev) => ({ ...prev, abilities: data.abilities || prev.abilities }));
+        if (data.abilities || data.skillAbilities) {
+          setState((prev) => ({
+            ...prev,
+            abilities: data.abilities || prev.abilities,
+            skillAbilities: data.skillAbilities || prev.skillAbilities
+          }));
+        }
       }
     });
     if (!completed) throw new Error("测评报告生成中断");
@@ -849,6 +1019,49 @@ export default function Home() {
       } else {
         setAssessmentProgress(undefined);
       }
+    }
+  }
+
+  function openCapture() {
+    setCapture({
+      open: true,
+      sourceCn: "",
+      loading: "",
+      error: "",
+      saved: false
+    });
+  }
+
+  async function generateCaptureCard() {
+    const sourceCn = capture.sourceCn.trim();
+    if (!sourceCn) {
+      setCapture((prev) => ({ ...prev, error: "请先输入中文个人场景" }));
+      return;
+    }
+    setCapture((prev) => ({ ...prev, loading: "正在生成表达卡…", error: "", saved: false }));
+    try {
+      const data = await api<CaptureResponse>("/api/capture", {
+        method: "POST",
+        body: JSON.stringify({ action: "generate", source_cn: sourceCn })
+      });
+      setCapture((prev) => ({ ...prev, card: data.card, sourceCn: data.card.source_cn, loading: "", error: "", saved: false }));
+    } catch (err) {
+      setCapture((prev) => ({ ...prev, loading: "", error: errorMessage(err, "表达卡生成失败") }));
+    }
+  }
+
+  async function saveCaptureCard() {
+    if (!capture.card) return;
+    setCapture((prev) => ({ ...prev, loading: "正在保存表达卡…", error: "" }));
+    try {
+      await api<CaptureResponse>("/api/capture", {
+        method: "POST",
+        body: JSON.stringify({ action: "save", card: capture.card })
+      });
+      await refresh();
+      setCapture((prev) => ({ ...prev, loading: "", error: "", saved: true }));
+    } catch (err) {
+      setCapture((prev) => ({ ...prev, loading: "", error: errorMessage(err, "表达卡保存失败") }));
     }
   }
 
@@ -952,6 +1165,11 @@ export default function Home() {
       </aside>
 
       <main className="main">
+        <button className="mobile-capture-entry" type="button" onClick={openCapture}>
+          <span><MessageSquarePlus size={22} />快速捕捉表达</span>
+          <small>先记下你的中文场景，生成可练习的英文表达卡</small>
+        </button>
+
         {assessment && !activeTraining && !paperPreview && (
           <StartPage
             mode="能力测评"
@@ -959,6 +1177,7 @@ export default function Home() {
             total={normalizedAssessmentOptions.initialCount}
             specialDimension={specialDimension}
             setSpecialDimension={setSpecialDimension}
+            skillAbilities={state.skillAbilities}
             assessmentOptions={assessmentOptions}
             setAssessmentOptions={setAssessmentOptions}
             loading={loading}
@@ -995,6 +1214,7 @@ export default function Home() {
             total={startTotal}
             specialDimension={specialDimension}
             setSpecialDimension={setSpecialDimension}
+            skillAbilities={state.skillAbilities}
             assessmentOptions={assessmentOptions}
             setAssessmentOptions={setAssessmentOptions}
             loading={loading}
@@ -1044,7 +1264,15 @@ export default function Home() {
         )}
 
         {activeTraining && visibleTrainingView && (
-          <section style={{ position: "relative" }}>
+          <section className="training-stage">
+            {activeQuestion && (
+              <AbilityMotionField
+                dimension={activeQuestion.dimension}
+                progress={progress.current + 1}
+                total={progress.total}
+                verdict={activeResult?.verdict}
+              />
+            )}
             <div className="topbar">
               <div>
                 <h1 className="title">
@@ -1061,8 +1289,8 @@ export default function Home() {
               <div className="floating">
                 <strong>今日能力变化</strong>
                 {state.abilities.map((item) => {
-                  const before = beforeScores.find((x) => x.dimension === item.dimension)?.score ?? 0;
-                  return <p key={item.dimension}>{item.dimension}：{before} → {item.score}</p>;
+                  const before = beforeScores.find((x) => x.dimension === item.dimension) ?? { dimension: item.dimension, score: 50, evidence_count: 0 };
+                  return <p key={item.dimension}>{item.dimension}：{abilityScoreLabel(before)} → {abilityScoreLabel(item)} · {before.evidence_count} → {item.evidence_count} 条证据</p>;
                 })}
               </div>
             )}
@@ -1072,8 +1300,11 @@ export default function Home() {
             {activeQuestion && (
               <>
                 <div className="question"><h2>{activeQuestion.chinese}</h2></div>
-                <p className="muted">考查维度：{activeQuestion.dimension}</p>
-                {activeMode === "能力测评" && Boolean(activeQuestion.vocabulary_tips?.length) && (
+                <div className="question-meta">
+                  <span>考查维度：{activeQuestion.dimension}</span>
+                  {publicQuestionSkills(activeQuestion.skills).map((skill) => <span className="question-skill" key={skill}>{skill}</span>)}
+                </div>
+                {Boolean(activeQuestion.vocabulary_tips?.length) && (
                   <div className="tips" aria-label="关键词提示">
                     <strong>TIPS</strong>
                     {activeQuestion.vocabulary_tips?.map((tip) => <span key={tip}>{tip}</span>)}
@@ -1095,7 +1326,7 @@ export default function Home() {
                   {!activeResult ? <button className="primary" onClick={submit} disabled={Boolean(loading) || !activeRecord.answer.trim()}>提交</button> : <button className="primary" onClick={() => nextQuestion()}>下一题</button>}
                 </div>
                 {activeMode !== "能力测评" && activeResult && <p className="muted">语法点说明：{activeQuestion.grammar_focus}</p>}
-                {activeMode !== "能力测评" && activeResult && <Feedback result={activeResult} />}
+                {activeMode !== "能力测评" && activeResult && <Feedback question={activeQuestion} userAnswer={activeRecord.answer} result={activeResult} />}
               </>
             )}
           </section>
@@ -1109,8 +1340,89 @@ export default function Home() {
           <SettingsPanel draft={settingsDraft} setDraft={setSettingsDraft} refresh={refresh} setError={setError} error={error} />
         )}
 
+        <button className="capture-fab" type="button" onClick={openCapture} aria-label="快速捕捉表达">
+          <MessageSquarePlus size={22} />
+        </button>
+        {capture.open && (
+          <QuickCaptureModal
+            capture={capture}
+            setCapture={setCapture}
+            onGenerate={generateCaptureCard}
+            onSave={saveCaptureCard}
+          />
+        )}
         {assessmentProgress && <AssessmentProgressModal progress={assessmentProgress} />}
       </main>
+    </div>
+  );
+}
+
+function QuickCaptureModal({ capture, setCapture, onGenerate, onSave }: {
+  capture: CaptureState;
+  setCapture: Dispatch<SetStateAction<CaptureState>>;
+  onGenerate: () => void;
+  onSave: () => void;
+}) {
+  const busy = Boolean(capture.loading);
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={() => setCapture((prev) => ({ ...prev, open: false }))}>
+      <section className="modal capture-modal" role="dialog" aria-modal="true" aria-labelledby="quick-capture-title" onClick={(event) => event.stopPropagation()}>
+        <div className="topbar">
+          <div>
+            <h2 id="quick-capture-title">快速捕捉表达</h2>
+            <p className="muted">输入一个中文个人场景，先生成预览，再保存到你的练习卡池。</p>
+          </div>
+          <button aria-label="关闭快速捕捉" onClick={() => setCapture((prev) => ({ ...prev, open: false }))}><X size={16} /></button>
+        </div>
+        <textarea
+          className="capture-input"
+          value={capture.sourceCn}
+          onChange={(event) => setCapture((prev) => ({ ...prev, sourceCn: event.target.value, saved: false }))}
+          placeholder="例如：我想跟同事说，我今天可能要晚一点交报告，因为上午一直在开会。"
+          disabled={busy}
+        />
+        <div className="actions">
+          <button onClick={onGenerate} disabled={busy || !capture.sourceCn.trim()}>
+            <RotateCcw size={16} /> {capture.card ? "重新生成" : "生成预览"}
+          </button>
+          <button className="primary" onClick={onSave} disabled={busy || !capture.card || capture.saved}>
+            {capture.saved ? "已保存" : "保存到练习"}
+          </button>
+        </div>
+        {capture.loading && <p className="loading"><span className="spinner" />{capture.loading}</p>}
+        {capture.error && <div className="notice">{capture.error}</div>}
+        {capture.saved && <div className="notice">表达卡已保存，会出现在每日练习中。</div>}
+        {capture.card && (
+          <div className="capture-preview">
+            <div className="capture-expression">
+              <span>Casual</span>
+              <p>{capture.card.casual}</p>
+            </div>
+            <div className="capture-expression standard">
+              <span>Standard</span>
+              <p>{capture.card.standard}</p>
+            </div>
+            <div className="capture-expression">
+              <span>Vivid</span>
+              <p>{capture.card.vivid}</p>
+            </div>
+            <div className="capture-meta-grid">
+              <div>
+                <strong>语法维度</strong>
+                <p>{capture.card.grammar_dimension}</p>
+              </div>
+              <div>
+                <strong>常见错误</strong>
+                <p>{capture.card.common_mistake}</p>
+              </div>
+              <div>
+                <strong>记忆钩子</strong>
+                <p>{capture.card.memory_hook}</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
     </div>
   );
 }
@@ -1154,12 +1466,13 @@ function AssessmentProgressModal({ progress }: { progress: AssessmentProgress })
   );
 }
 
-function StartPage({ mode, state, total, specialDimension, setSpecialDimension, assessmentOptions, setAssessmentOptions, loading, error, onGenerate, onSkipAssessment }: {
+function StartPage({ mode, state, total, specialDimension, setSpecialDimension, skillAbilities, assessmentOptions, setAssessmentOptions, loading, error, onGenerate, onSkipAssessment }: {
   mode: TrainingMode;
   state: AppState;
   total: number;
   specialDimension: Dimension;
   setSpecialDimension: (value: Dimension) => void;
+  skillAbilities: SkillAbility[];
   assessmentOptions: AssessmentOptions;
   setAssessmentOptions: Dispatch<SetStateAction<AssessmentOptions>>;
   loading: string;
@@ -1168,6 +1481,7 @@ function StartPage({ mode, state, total, specialDimension, setSpecialDimension, 
   onSkipAssessment?: () => void;
 }) {
   const activeMistakes = state.mistakes.filter((item) => item.correct_streak < 2).length;
+  const weakSpecialSkills = weakSkillsForDimension(skillAbilities, specialDimension);
   const disabled = Boolean(loading) || (mode === "错题重练" && total < 1);
   const normalizedAssessmentOptions = normalizeAssessmentOptions(assessmentOptions);
   const description = mode === "能力测评"
@@ -1175,7 +1489,7 @@ function StartPage({ mode, state, total, specialDimension, setSpecialDimension, 
       ? `开始后会先生成 ${normalizedAssessmentOptions.initialCount} 道测评题；系统会根据薄弱和不确定维度最多追加到 ${normalizedAssessmentOptions.maxCount} 题，结束后统一生成能力报告。`
       : `开始后只生成 ${normalizedAssessmentOptions.initialCount} 道测评题，不自动追加题目，结束后统一生成能力报告。`
     : mode === "每日练习"
-      ? `开始后会一次性生成 ${total} 道题，优先穿插未掌握错题，再根据当前能力选择薄弱维度。`
+      ? `开始后会一次性生成 ${total} 道题，优先加入 ${state.activeCapturedDrillCount} 张快速捕捉卡，再根据当前能力选择薄弱维度。`
       : mode === "专项训练"
         ? `开始后会一次性生成 ${total} 道 ${specialDimension} 题，集中训练单一语法维度。`
         : activeMistakes > 0
@@ -1240,13 +1554,38 @@ function StartPage({ mode, state, total, specialDimension, setSpecialDimension, 
         </section>
       )}
 
+      {mode === "专项训练" && (
+        <section className="section weak-skill-panel">
+          <h2>{specialDimension}薄弱技能</h2>
+          {weakSpecialSkills.length === 0 && <p className="muted">当前没有足够的二级技能证据，系统会先按一级维度生成题目。</p>}
+          {weakSpecialSkills.length > 0 && (
+            <div className="skill-list">
+              {weakSpecialSkills.map((item) => (
+                <span className="skill-pill weak" key={`${item.dimension}-${item.skill}`}>
+                  {item.skill} <strong>{formatAbilityScore(item.score)}</strong> <em>证据 {item.evidence_count}</em>
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       <div className="section radar-wrap">
         <Radar abilities={state.abilities} />
         <div className="bars">
           <h2>当前能力预览</h2>
           {state.abilities.map((item) => (
-            <div className="bar-row" key={item.dimension}>
-              <span>{item.dimension}</span><div className="bar"><span style={{ width: `${item.score}%` }} /></div><strong>{item.score}</strong>
+            <div className="ability-stat" key={item.dimension}>
+              <div className={`bar-row${item.evidence_count === 0 ? " no-evidence" : ""}`}>
+                <span>{item.dimension}</span><div className="bar"><span style={{ width: `${item.score}%` }} /></div><strong>{abilityScoreLabel(item)}</strong><em>{abilityEvidenceLabel(item)}</em>
+              </div>
+              <div className="skill-list compact">
+                {weakSkillsForDimension(state.skillAbilities, item.dimension, 3).map((skill) => (
+                  <span className="skill-pill weak" key={`${skill.dimension}-${skill.skill}`}>
+                    {skill.skill} <strong>{formatAbilityScore(skill.score)}</strong> <em>证据 {skill.evidence_count}</em>
+                  </span>
+                ))}
+              </div>
             </div>
           ))}
         </div>
@@ -1627,6 +1966,10 @@ function Stats({ state, trend, trendDimension, setTrendDimension, errorDistribut
 }) {
   const maxErrors = Math.max(1, ...errorDistribution.map((x) => x[1]));
   const latestReport = state.latestAssessmentReport;
+  const weakSkills = state.skillAbilities
+    .filter((item) => item.evidence_count > 0)
+    .sort((a, b) => a.score - b.score || b.evidence_count - a.evidence_count)
+    .slice(0, 12);
   const points = trend.map((item, index) => {
     const x = trend.length <= 1 ? 10 : (index / (trend.length - 1)) * 280 + 10;
     const y = 160 - item.score * 1.4;
@@ -1639,13 +1982,27 @@ function Stats({ state, trend, trendDimension, setTrendDimension, errorDistribut
         <Radar abilities={state.abilities} onPick={onPickDimension} />
         <div className="bars">
           {state.abilities.map((item) => (
-            <div className="bar-row" key={item.dimension}>
-              <span>{item.dimension}</span><div className="bar"><span style={{ width: `${item.score}%` }} /></div><strong>{item.score}</strong>
+            <div className="ability-stat" key={item.dimension}>
+              <div className={`bar-row${item.evidence_count === 0 ? " no-evidence" : ""}`}>
+                <span>{item.dimension}</span><div className="bar"><span style={{ width: `${item.score}%` }} /></div><strong>{abilityScoreLabel(item)}</strong><em>{abilityEvidenceLabel(item)}</em>
+              </div>
+              <div className="skill-list compact">
+                {weakSkillsForDimension(state.skillAbilities, item.dimension, 3).map((skill) => (
+                  <button className="skill-pill weak" key={`${skill.dimension}-${skill.skill}`} onClick={() => onPickDimension(item.dimension)}>
+                    {skill.skill} <strong>{formatAbilityScore(skill.score)}</strong> <em>证据 {skill.evidence_count}</em>
+                  </button>
+                ))}
+              </div>
             </div>
           ))}
         </div>
       </section>
       <div className="grid">
+        <section className="section">
+          <h2>最近每日练习报告</h2>
+          {!state.latestPracticeReport && <p className="muted">完成一次每日练习后会生成客观报告。</p>}
+          {state.latestPracticeReport && <PracticeReportView report={state.latestPracticeReport} />}
+        </section>
         <section className="section">
           <h2>最近测评报告</h2>
           {!latestReport && <p className="muted">暂无测评报告</p>}
@@ -1674,12 +2031,62 @@ function Stats({ state, trend, trendDimension, setTrendDimension, errorDistribut
             {errorDistribution.map(([type, count]) => <div className="bar-row" key={type}><span>{type}</span><div className="bar"><span style={{ width: `${(count / maxErrors) * 100}%` }} /></div><strong>{count}</strong></div>)}
           </div>
         </section>
+        <section className="section">
+          <h2>二级技能诊断</h2>
+          {weakSkills.length === 0 && <p className="muted">暂无二级技能证据。完成一次新批改或打开状态接口后，系统会从历史答题记录中回填。</p>}
+          {weakSkills.length > 0 && (
+            <div className="skill-diagnosis-list">
+              {weakSkills.map((item) => (
+                <button className="skill-diagnosis-item" key={`${item.dimension}-${item.skill}`} onClick={() => onPickDimension(item.dimension)}>
+                  <span>{item.dimension}</span>
+                  <strong>{item.skill}</strong>
+                  <em>{formatAbilityScore(item.score)} / 证据 {item.evidence_count}</em>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
       <section className="section">
         <h2>训练记录</h2>
         <table className="table"><thead><tr><th>日期</th><th>模式</th><th>题数</th><th>正确率</th></tr></thead><tbody>{state.records.map((r) => <tr key={r.id}><td>{r.date}</td><td>{r.mode}</td><td>{r.total}</td><td>{r.accuracy}%</td></tr>)}</tbody></table>
       </section>
     </>
+  );
+}
+
+function PracticeReportView({ report }: { report: PracticeReport }) {
+  return (
+    <div className="practice-report">
+      <p className="muted">{new Date(report.date).toLocaleString()} · Session #{report.session_id}</p>
+      <div className="report-metrics">
+        <div><span>题数</span><strong>{report.total}</strong></div>
+        <div><span>正确率</span><strong>{report.accuracy}%</strong></div>
+        <div><span>客观均分</span><strong>{report.average_score}</strong></div>
+        <div><span>平均用时</span><strong>{report.average_duration_seconds}s</strong></div>
+      </div>
+      <div className="verdict-stack">
+        <span className="verdict-chip correct">正确 {report.correct}</span>
+        <span className="verdict-chip partial">基本正确 {report.partial}</span>
+        <span className="verdict-chip wrong">错误 {report.wrong}</span>
+      </div>
+      <strong>维度表现</strong>
+      <div className="dimension-report-list">
+        {report.dimension_reports.map((item) => (
+          <div className="dimension-report-item" key={item.dimension}>
+            <div className="row"><strong>{item.dimension}</strong><span>{item.average_score} / {item.accuracy}%</span></div>
+            <p className="muted">{item.correct} 正确 · {item.partial} 基本正确 · {item.wrong} 错误 · 证据 {item.evidence_count}</p>
+            {item.notes[0] && <p>{item.notes[0]}</p>}
+          </div>
+        ))}
+      </div>
+      <strong>优势</strong>
+      {report.strengths.map((item, index) => <p key={`practice-strength-${index}`}>{index + 1}. {item}</p>)}
+      <strong>待改进</strong>
+      {report.weaknesses.map((item, index) => <p key={`practice-weak-${index}`}>{index + 1}. {item}</p>)}
+      <strong>建议</strong>
+      {report.recommendations.map((item, index) => <p key={`practice-rec-${index}`}>{index + 1}. {item}</p>)}
+    </div>
   );
 }
 
@@ -1691,16 +2098,27 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error }: {
   error: string;
 }) {
   const [message, setMessage] = useState("");
+  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   async function save() {
     await api("/api/settings", { method: "PUT", body: JSON.stringify(draft) });
     setMessage("设置已保存");
+    setTestResult(null);
     await refresh();
   }
   async function test() {
     setMessage("正在测试连接…");
+    setTestResult(null);
     try {
-      await api("/api/settings/test", { method: "POST" });
-      setMessage("连接成功");
+      const res = await fetch("/api/settings/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(draft)
+      });
+      const data = await res.json().catch(() => ({})) as ConnectionTestResponse;
+      const result = res.ok ? data : data.result;
+      if (result) setTestResult(result);
+      if (!res.ok) throw new Error(data.message || "连接失败");
+      setMessage("连接成功，所有测试项已通过");
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "连接失败");
     }
@@ -1730,6 +2148,19 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error }: {
         <button className="danger" onClick={() => reset("all")}>清除所有数据</button>
       </div>
       {(message || error) && <div className="notice">{message || error}</div>}
+      {testResult && (
+        <div className="connection-test-list">
+          {testResult.tests.map((item) => (
+            <div key={item.key} className={item.ok ? "connection-test-item ok" : "connection-test-item failed"}>
+              {item.ok ? <CheckCircle2 size={17} /> : <X size={17} />}
+              <div>
+                <strong>{item.label}</strong>
+                <span>{item.detail}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

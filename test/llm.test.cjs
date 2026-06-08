@@ -3,7 +3,8 @@ require("./setup.cjs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { generateAssessmentNarrativeStream, generateQuestion, generateStudyGuide, gradeAnswer } = require("../lib/llm.ts");
+const { generateAssessmentNarrativeStream, generateDrillCard, generateQuestion, generateQuestions, generateStudyGuide, gradeAnswer, testConnection } = require("../lib/llm.ts");
+const { publicQuestionSkills } = require("../lib/questionSafety.ts");
 
 function settings() {
   return {
@@ -47,6 +48,196 @@ function reasoningOnlyStreamResponse(reasoning) {
     headers: { "Content-Type": "text/event-stream" }
   });
 }
+
+test("public question skills remove answer-revealing formulas", () => {
+  assert.deepEqual(publicQuestionSkills([
+    "By + 过去时间，主句使用过去完成时 had done",
+    "read three chapters of that book 表示部分与整体关系",
+    "already 用于完成时态句中",
+    "过去完成时判断",
+    "完成时态语境"
+  ]), ["过去完成时判断"]);
+});
+
+test("connection test covers model list, structured, text, thinking, and streaming scenarios", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    if (String(url).endsWith("/v1/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const request = JSON.parse(init.body);
+    requests.push(request);
+    if (request.stream && request.stream_options) {
+      return new Response("unsupported stream_options", { status: 400 });
+    }
+    if (request.stream) {
+      return reasoningOnlyStreamResponse(JSON.stringify({
+        summary: "流式测试显示连接正常。",
+        weak_points: ["时态：过去式需要继续练习。"],
+        recommendations: ["每天做 1 道过去时练习。"]
+      }));
+    }
+    if (!request.response_format) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "连接测试已经正常通过。" } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (request.enable_thinking) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: "",
+            reasoning_content: JSON.stringify({
+              summary: "thinking 测试显示连接正常。",
+              weak_points: ["时态：过去式需要继续练习。"],
+              recommendations: ["每天做 1 道过去时练习。"]
+            })
+          }
+        }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ ok: true }) } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await testConnection(settings());
+
+    assert.equal(result.modelFound, true);
+    assert.deepEqual(result.tests.map((item) => [item.key, item.ok]), [
+      ["models", true],
+      ["model", true],
+      ["structured_no_thinking", true],
+      ["structured_thinking", true],
+      ["plain_text", true],
+      ["streaming", true]
+    ]);
+    assert.equal(requests[0].messages[1].content.includes("/no_think"), true);
+    assert.equal(requests[1].enable_thinking, true);
+    assert.equal(requests[2].response_format, undefined);
+    assert.equal(requests[3].stream_options.include_usage, true);
+    assert.equal(requests[4].stream, true);
+    assert.equal("stream_options" in requests[4], false);
+    assert.match(result.tests.find((item) => item.key === "streaming").detail, /无 stream_options/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("connection test exposes failed response validation details", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    if (String(url).endsWith("/v1/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const request = JSON.parse(init.body);
+    if (!request.response_format) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "" } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ ok: true }) } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    await assert.rejects(
+      () => testConnection(settings()),
+      (error) => {
+        assert.match(error.message, /未全部通过/);
+        const result = error.connectionTestResult;
+        assert.equal(result.tests.find((item) => item.key === "plain_text").ok, false);
+        assert.equal(result.tests.find((item) => item.key === "structured_no_thinking").ok, true);
+        return true;
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("connection test accepts very short plain text responses", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    if (String(url).endsWith("/v1/models")) {
+      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    const request = JSON.parse(init.body);
+    if (request.stream) {
+      return reasoningOnlyStreamResponse(JSON.stringify({
+        summary: "流式测试显示连接正常。",
+        weak_points: ["时态：过去式需要继续练习。"],
+        recommendations: ["每天做 1 道过去时练习。"]
+      }));
+    }
+    if (!request.response_format) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "正常" } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (request.enable_thinking) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              summary: "thinking 测试显示连接正常。",
+              weak_points: ["时态：过去式需要继续练习。"],
+              recommendations: ["每天做 1 道过去时练习。"]
+            })
+          }
+        }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ ok: true }) } }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await testConnection(settings());
+    const plainTextTest = result.tests.find((item) => item.key === "plain_text");
+    assert.equal(plainTextTest.ok, true);
+    assert.match(plainTextTest.detail, /返回 2 个字符/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
 
 test("assessment narrative stream keeps enable_thinking when retrying without stream_options", async () => {
   const requests = [];
@@ -153,7 +344,7 @@ test("question generation can opt into thinking mode", async () => {
             vocabulary_tips: ["finish", "homework", "yesterday"],
             grammar_focus: "一般过去时",
             secondary_dimensions: ["冠词"],
-            skills: ["过去式动词"],
+            skills: ["过去式动词", "finish 使用过去式 finished"],
             rubric_points: ["动词使用过去式"]
           })
         }
@@ -179,7 +370,91 @@ test("question generation can opt into thinking mode", async () => {
     assert.equal(requests.length, 1);
     assert.equal(requests[0].enable_thinking, true);
     assert.equal(requests[0].messages[1].content.includes("/no_think"), false);
+    assert.equal(requests[0].messages[1].content.includes("高信息密度"), false);
+    assert.equal(requests[0].messages[1].content.includes("1-2 个可独立评分的次要维度"), true);
+    assert.match(requests[0].messages[1].content, /先保证生活化，再考虑语法覆盖/);
+    assert.match(requests[0].messages[1].content, /公平但不能泄题/);
+    assert.match(requests[0].messages[1].content, /禁止出现任何英文字母/);
+    assert.match(requests[0].messages[1].content, /不要写“was\/were \+ past participle”/);
     assert.equal(question.chinese, "昨天我完成了作业。");
+    assert.deepEqual(question.skills, ["过去式动词"]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("drill card generation sends structured schema and normalizes reference answer", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, init) => {
+    const request = JSON.parse(init.body);
+    requests.push(request);
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            casual: "I was in meetings all morning, so I might send the report a bit later.",
+            standard: "I was in meetings all morning, so I may submit the report a little later.",
+            vivid: "My morning was packed with meetings, so the report may come a little later.",
+            source_cn: "我今天上午一直在开会，所以报告可能晚点交。",
+            reference_en: "This should be overwritten.",
+            grammar_dimension: "连接词",
+            common_mistake: "容易把 because 和 so 重复使用。",
+            memory_hook: "先原因，再结果。"
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const card = await generateDrillCard(settings(), "我今天上午一直在开会，所以报告可能晚点交。");
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].response_format.json_schema.name, "drill_card");
+    assert.equal(requests[0].messages[1].content.includes("/no_think"), true);
+    assert.match(requests[0].messages[1].content, /grammar_dimension 只能从以下 6 个值中选 1 个/);
+    assert.equal(card.reference_en, card.standard);
+    assert.equal(card.grammar_dimension, "连接词");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("drill card generation parses JSON from reasoning_content and normalizes unknown dimension", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: "",
+          reasoning_content: JSON.stringify({
+            casual: "I might be a little late today.",
+            standard: "I may be a little late today.",
+            vivid: "I may run a little late today.",
+            source_cn: "我今天可能会迟到一点。",
+            reference_en: "I may be a little late today.",
+            grammar_dimension: "语序",
+            common_mistake: "容易把 may 放在动词后面。",
+            memory_hook: "可能先放 may，再接动词原形。"
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const card = await generateDrillCard(settings(), "我今天可能会迟到一点。");
+
+    assert.equal(card.source_cn, "我今天可能会迟到一点。");
+    assert.equal(card.reference_en, "I may be a little late today.");
+    assert.equal(card.grammar_dimension, "连接词");
   } finally {
     global.fetch = originalFetch;
   }
@@ -217,6 +492,66 @@ test("question generation accepts structured JSON from reasoning_content when co
     assert.equal(question.chinese, "这种水果通常只在夏天才能买到。");
     assert.equal(question.answers[0], "This kind of fruit is usually only available in summer.");
     assert.deepEqual(question.secondary_dimensions, ["时态", "介词搭配"]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("batch question generation requests all questions in one structured call", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, init) => {
+    const request = JSON.parse(init.body);
+    requests.push(request);
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            questions: [
+              {
+                chinese: "昨天我在车站等了十分钟。",
+                answers: ["I waited at the station for ten minutes yesterday."],
+                vocabulary_tips: ["wait", "station", "minute"],
+                grammar_focus: "一般过去时 + 地点介词 + 时间介词",
+                secondary_dimensions: ["介词搭配", "冠词"],
+                skills: ["过去式动词", "地点介词", "时间介词"],
+                rubric_points: ["wait 使用过去式", "at the station 搭配正确"]
+              },
+              {
+                chinese: "这封邮件已经被经理回复了。",
+                answers: ["This email has already been replied to by the manager."],
+                vocabulary_tips: ["email", "reply", "manager"],
+                grammar_focus: "现在完成时被动语态 + 冠词",
+                secondary_dimensions: ["时态", "冠词"],
+                skills: ["现在完成时", "被动语态结构", "特指冠词"],
+                rubric_points: ["使用 has been replied to", "the manager 表达正确"]
+              }
+            ]
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const questions = await generateQuestions(settings(), [
+      { dimension: "时态", difficulty: 45, paperPosition: "第 1/2 题" },
+      { dimension: "被动语态", difficulty: 60, paperPosition: "第 2/2 题" }
+    ], true, ["我昨天去了商店。"]);
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].response_format.json_schema.name, "assessment_question_batch");
+    assert.match(requests[0].messages[1].content, /一次性生成 2 道/);
+    assert.match(requests[0].messages[1].content, /场景尽量分散/);
+    assert.match(requests[0].messages[1].content, /像日常微信、课堂、办公室、家里/);
+    assert.match(requests[0].messages[1].content, /禁止生成明显教材化、百科化、脱离日常的模板句/);
+    assert.match(requests[0].messages[1].content, /secondary_dimensions 给 1-2 个/);
+    assert.equal(questions.length, 2);
+    assert.equal(questions[0].dimension, "时态");
+    assert.equal(questions[1].dimension, "被动语态");
   } finally {
     global.fetch = originalFetch;
   }
@@ -419,6 +754,49 @@ test("grading downgrades overall verdict when the primary dimension is only part
   }
 });
 
+test("grading downgrades overall verdict when a secondary core dimension has a major failure", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            verdict: "partial",
+            error_types: ["tense", "verb_form", "preposition"],
+            reference_answers: ["I left my umbrella on the bus, and I am walking home in the rain now."],
+            differences: ["用户后半句没有使用现在进行时。", "用户写了 to home。"],
+            explanations: ["现在正回家应使用 am walking home。"],
+            memory_tip: "",
+            dimension_scores: [
+              { dimension: "介词搭配", score: 85, verdict: "correct", severity: "minor", notes: "on the bus 正确，但 to home 不自然。" },
+              { dimension: "时态", score: 20, verdict: "wrong", severity: "major", notes: "was walk 不是正确结构，也没有表达现在进行时。" }
+            ],
+            skill_findings: ["现在进行时结构薄弱", "home 作副词用法薄弱"]
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await gradeAnswer(settings(), {
+      chinese: "我把雨伞忘在了公交车上，现在正淋着雨回家。",
+      answers: ["I left my umbrella on the bus, and I am walking home in the rain now."],
+      grammar_focus: "交通工具介词 + 一般过去时 + 现在进行时",
+      dimension: "介词搭配",
+      secondary_dimensions: ["时态"],
+      difficulty: 60
+    }, "I left my umbrella on the bus, so I was walk to home in the rain.");
+
+    assert.equal(result.verdict, "wrong");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("grading parses structured JSON from reasoning_content when content is empty", async () => {
   const originalFetch = global.fetch;
   global.fetch = async () => {
@@ -508,6 +886,104 @@ test("grading preserves a full-score result for a clearly perfect answer", async
       ["时态", 100],
       ["冠词", 100]
     ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("grading prompt treats hidden reference-only structures as non-mandatory", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            verdict: "partial",
+            error_types: ["subject_verb_agreement"],
+            reference_answers: ["I am used to drinking coffee every morning, but my brother only likes tea."],
+            differences: ["my brother 后 like 应改为 likes。"],
+            explanations: ["usually drink 能自然表达每天早晨喝咖啡的习惯，但第三人称单数需要 likes。"],
+            memory_tip: "",
+            dimension_scores: [
+              { dimension: "介词搭配", score: 65, verdict: "partial", severity: "minor", notes: "习惯表达可接受，但后半句主谓一致错误。" }
+            ],
+            skill_findings: ["第三人称单数谓语变化"]
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await gradeAnswer(settings(), {
+      chinese: "我习惯每天早晨喝咖啡，但我的弟弟只喜欢喝茶。",
+      answers: ["I am used to drinking coffee every morning, but my brother only likes tea."],
+      grammar_focus: "be used to doing 习惯表达",
+      dimension: "介词搭配",
+      secondary_dimensions: ["冠词"],
+      skills: ["习惯表达辨析", "动名词作宾语", "频率副词位置", "人称代词所有格", "转折逻辑衔接"],
+      difficulty: 55
+    }, "I usually drink coffee every morning, but my brother only like drinking tea.");
+
+    const prompt = requests[0].messages.map((message) => message.content).join("\n");
+    assert.match(prompt, /做题前可见技能标签/);
+    assert.match(prompt, /不能把做题前不可见的特定参考句式当成唯一正确答案/);
+    assert.match(prompt, /usually do 或 be used to doing/);
+    assert.equal(result.verdict, "partial");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("grading prompt allows natural determiner variants for specific references", async () => {
+  const requests = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            verdict: "correct",
+            error_types: [],
+            reference_answers: ["My sister likes the girl who always wears a red dress."],
+            differences: ["that girl 和 the girl 都可表达特指。"],
+            explanations: ["定语从句、第三人称单数和 a red dress 均正确。"],
+            memory_tip: "",
+            dimension_scores: [
+              { dimension: "定语从句", score: 95, verdict: "correct", severity: "minor", notes: "who 引导定语从句正确。" },
+              { dimension: "冠词", score: 95, verdict: "correct", severity: "minor", notes: "that girl 可自然表达“那个女孩”。" }
+            ],
+            skill_findings: []
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await gradeAnswer(settings(), {
+      chinese: "我妹妹喜欢那个总是穿红裙子的女孩。",
+      answers: ["My sister likes the girl who always wears a red dress."],
+      grammar_focus: "who 引导定语从句 + 冠词",
+      dimension: "定语从句",
+      secondary_dimensions: ["冠词", "时态"],
+      skills: ["who 引导定语从句", "第三人称单数", "频度副词位置", "特指表达", "泛指单数名词"],
+      difficulty: 55
+    }, "My sister likes that girl who always wears a red dress.");
+
+    const prompt = requests[0].messages.map((message) => message.content).join("\n");
+    assert.match(prompt, /that girl who always wears a red dress/);
+    assert.match(prompt, /不能仅因参考答案是 “the girl who\.\.\.” 就判错/);
+    assert.equal(result.verdict, "correct");
   } finally {
     global.fetch = originalFetch;
   }

@@ -1,4 +1,5 @@
-import { DIMENSIONS, Dimension, DimensionScore, GradeResult, Question, Settings, StudyGuide } from "./types";
+import { DIMENSIONS, Dimension, DimensionScore, DrillCard, FollowUpMessage, GradeResult, Question, Settings, StudyGuide } from "./types";
+import { publicQuestionSkills } from "./questionSafety";
 
 function stripCodeFence(text: string) {
   return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
@@ -47,6 +48,24 @@ type AssessmentNarrativePayload = {
   totalQuestions: number;
   matrix: Array<{ dimension: Dimension; score: number; confidence: number; evidence_count: number }>;
   findings: string[];
+  evidence_details?: Array<{
+    question_index: number;
+    dimension: Dimension;
+    secondary_dimensions: Dimension[];
+    difficulty: number;
+    grammar_focus: string;
+    skills: string[];
+    rubric_points: string[];
+    chinese: string;
+    user_answer: string;
+    reference_answer: string;
+    verdict: GradeResult["verdict"];
+    error_types: string[];
+    dimension_scores: DimensionScore[];
+    differences: string[];
+    explanations: string[];
+    skill_findings: string[];
+  }>;
 };
 
 type StudyGuideQuestionOutline = {
@@ -141,12 +160,14 @@ function normalizeDimensionScores(value: unknown, primary: Dimension): Dimension
 
 function normalizeGradeVerdict(verdict: GradeResult["verdict"], scores: DimensionScore[], primary: Dimension): GradeResult["verdict"] {
   const primaryScore = scores.find((item) => item.dimension === primary);
+  const hasMajorFailure = scores.some((item) => item.severity === "major" && (item.verdict === "wrong" || item.score < 45));
+  if (hasMajorFailure) return "wrong";
   if (!primaryScore) return verdict;
   if (primaryScore.score >= 80 && primaryScore.verdict === "correct") return verdict === "wrong" ? "partial" : verdict;
   return primaryScore.score < 45 || primaryScore.verdict === "wrong" ? "wrong" : "partial";
 }
 
-type ChatMessage = { role: "system" | "user"; content: string };
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 type JsonSchema = {
   type: "object";
@@ -178,6 +199,19 @@ type AssessmentNarrative = {
   summary: string;
   weak_points: string[];
   recommendations: string[];
+};
+
+export type ConnectionTestItem = {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+};
+
+export type ConnectionTestResult = {
+  models: unknown[];
+  modelFound: boolean | null;
+  tests: ConnectionTestItem[];
 };
 
 export type AssessmentNarrativeStreamProgress = {
@@ -261,6 +295,31 @@ function schemaResponseFormat(name: string, schema: JsonSchema): ChatPayload["re
 
 const dimensionSchema = { type: "string", enum: DIMENSIONS };
 const stringArraySchema = { type: "array", items: { type: "string" } };
+type GeneratedQuestionPayload = {
+  chinese: string;
+  answers: string[];
+  vocabulary_tips?: string[];
+  grammar_focus: string;
+  secondary_dimensions?: string[];
+  skills?: string[];
+  rubric_points?: string[];
+};
+type DrillCardPayload = {
+  casual?: string;
+  standard?: string;
+  vivid?: string;
+  source_cn?: string;
+  reference_en?: string;
+  grammar_dimension?: string;
+  common_mistake?: string;
+  memory_hook?: string;
+};
+type QuestionGenerationSpec = {
+  dimension: Dimension;
+  difficulty: number;
+  paperPosition?: string;
+  focusSkills?: string[];
+};
 
 const connectionSchema: JsonSchema = {
   type: "object",
@@ -274,7 +333,7 @@ const connectionSchema: JsonSchema = {
 function questionSchema(includeVocabularyTips: boolean): JsonSchema {
   const properties: JsonSchema["properties"] = {
     chinese: { type: "string" },
-    answers: { type: "array", items: { type: "string" } },
+    answers: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 1 },
     grammar_focus: { type: "string" },
     secondary_dimensions: { type: "array", items: dimensionSchema },
     skills: { type: "array", items: { type: "string" } },
@@ -293,13 +352,29 @@ function questionSchema(includeVocabularyTips: boolean): JsonSchema {
   };
 }
 
+function questionBatchSchema(includeVocabularyTips: boolean, count: number): JsonSchema {
+  return {
+    type: "object",
+    properties: {
+      questions: {
+        type: "array",
+        minItems: count,
+        maxItems: count,
+        items: questionSchema(includeVocabularyTips)
+      }
+    },
+    required: ["questions"],
+    additionalProperties: false
+  };
+}
+
 function gradeSchema(primary: Dimension): JsonSchema {
   return {
     type: "object",
     properties: {
       verdict: { type: "string", enum: ["correct", "partial", "wrong"] },
       error_types: stringArraySchema,
-      reference_answers: { type: "array", items: { type: "string" } },
+      reference_answers: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 1 },
       differences: stringArraySchema,
       explanations: stringArraySchema,
       memory_tip: { type: "string" },
@@ -377,23 +452,46 @@ const studyGuideSchema: JsonSchema = {
   additionalProperties: false
 };
 
+const drillCardSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    casual: { type: "string" },
+    standard: { type: "string" },
+    vivid: { type: "string" },
+    source_cn: { type: "string" },
+    reference_en: { type: "string" },
+    grammar_dimension: dimensionSchema,
+    common_mistake: { type: "string" },
+    memory_hook: { type: "string" }
+  },
+  required: ["casual", "standard", "vivid", "source_cn", "reference_en", "grammar_dimension", "common_mistake", "memory_hook"],
+  additionalProperties: false
+};
+
 function assessmentNarrativeMessages(payload: AssessmentNarrativePayload): ChatMessage[] {
+  const sortedMatrix = [...payload.matrix].sort((a, b) => a.score - b.score || a.confidence - b.confidence || a.evidence_count - b.evidence_count);
   return [
     {
       role: "system",
-      content: "你是一位英语写作能力测评老师。请按结构化输出 schema 生成中文总结报告。"
+      content: `你是一位严谨的中译英写作能力测评老师。请只输出符合 schema 的 JSON，不要输出 markdown。
+报告必须具体、可执行，并且基于输入证据判断；不要写泛泛的鼓励、空话或与证据无关的结论。`
     },
     {
       role: "user",
       content: `请根据以下结构化测评结果，生成中文总结报告。
 题量：${payload.totalQuestions}
 能力矩阵：${JSON.stringify(payload.matrix)}
+低分优先矩阵：${JSON.stringify(sortedMatrix)}
+逐题结构化证据：${JSON.stringify((payload.evidence_details ?? []).slice(0, 20))}
 典型证据：${JSON.stringify(payload.findings.slice(0, 30))}
 
 要求：
-1. summary 用 2-4 句话概括当前中译英写作能力。
-2. weak_points 给 3-6 条最需要优先处理的薄弱点。
-3. recommendations 给 3-6 条具体训练建议。`
+1. summary 用 2-4 句话，必须说明整体水平、最弱 1-2 个维度、相对稳定维度，以及置信度/证据量是否足够；不要只说“需要加强”。
+2. weak_points 给 3-6 条最需要优先处理的薄弱点，按优先级排序。每条必须包含：维度名称、分数或证据量、具体错误表现、为什么影响中译英质量；优先引用逐题结构化证据中的用户译文、dimension_scores.notes、differences、explanations 或 skill_findings。
+3. recommendations 给 3-6 条具体训练建议，必须和 weak_points 一一呼应。每条建议要包含训练动作、练习量或频率、检查标准，例如“连续 3 天每天 5 句”“每句先标主谓宾/时态/从句边界”。
+4. 对 evidence_count 为 0 或 confidence 低于 0.5 的维度，不要武断下结论；应写成“证据不足，需要补测确认”。
+5. 如果某个维度 score 低于 60，应明确列为优先薄弱点；60-75 写成不稳定；80 以上只在 summary 中作为相对优势提及。
+6. 所有内容使用中文，面向学习者，语气直接但不责备。`
     }
   ];
 }
@@ -557,6 +655,18 @@ function estimateGeneratedTokens(text: string) {
   return Math.max(1, Math.ceil(text.length / 2));
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim());
+}
+
+function validateAssessmentNarrative(value: Partial<AssessmentNarrative>) {
+  const weakPoints = value.weak_points;
+  const recommendations = value.recommendations;
+  if (!isMeaningfulText(value.summary)) throw new Error("summary 缺失或内容过短");
+  if (!isStringArray(weakPoints) || !weakPoints.length) throw new Error("weak_points 必须是非空字符串数组");
+  if (!isStringArray(recommendations) || !recommendations.length) throw new Error("recommendations 必须是非空字符串数组");
+}
+
 async function readChatStream(
   res: Response,
   onProgress?: (progress: AssessmentNarrativeStreamProgress) => void
@@ -657,17 +767,170 @@ async function chat<T>(settings: Settings, messages: ChatMessage[], schemaName: 
   }
 }
 
+async function chatText(settings: Settings, messages: ChatMessage[]): Promise<string> {
+  if (!settings.model) throw new Error("请先在设置页填写 LM Studio 模型名称");
+  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+  let activePayload: ChatPayload = {
+    model: settings.model,
+    temperature: settings.temperature,
+    messages: withoutThinking(messages),
+    enable_thinking: false
+  };
+  let res = await postChat(endpoint, activePayload);
+  let errorText = "";
+  if (!res.ok) {
+    errorText = await res.text();
+    if (unsupportedThinkingParam(errorText)) {
+      activePayload = {
+        model: activePayload.model,
+        temperature: activePayload.temperature,
+        messages: activePayload.messages
+      };
+      res = await postChat(endpoint, activePayload);
+      errorText = res.ok ? "" : await res.text();
+    }
+  }
+  if (!res.ok) throw new Error(`LM Studio 请求失败：${res.status} ${errorText}`);
+  const data = await res.json();
+  const content = stripThinking(extractContent(data)).trim();
+  if (!content) throw new Error("AI 没有返回追问解答");
+  return content;
+}
+
 export async function testConnection(settings: Settings) {
   const res = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/v1/models`, { cache: "no-store" });
   if (!res.ok) throw new Error(`无法连接 LM Studio：${res.status}`);
   const models = await res.json();
-  if (settings.model) {
-    await chat<{ ok: boolean }>(settings, [
-      { role: "system", content: "你用于测试 LM Studio 结构化输出连接。" },
-      { role: "user", content: "返回连接状态 ok 为 true。" }
-    ], "connection_test", connectionSchema);
+  const modelList = Array.isArray(models?.data) ? models.data : [];
+  const tests: ConnectionTestItem[] = [];
+  const modelFound = settings.model
+    ? modelList.some((model: unknown) => {
+      if (!model || typeof model !== "object") return false;
+      const item = model as Record<string, unknown>;
+      return item.id === settings.model || item.model === settings.model || item.name === settings.model;
+    })
+    : null;
+
+  async function runTest(key: string, label: string, test: () => Promise<string>) {
+    try {
+      const detail = await test();
+      tests.push({ key, label, ok: true, detail });
+    } catch (error) {
+      tests.push({ key, label, ok: false, detail: error instanceof Error ? error.message : "测试失败" });
+    }
   }
-  return models;
+
+  tests.push({
+    key: "models",
+    label: "模型列表",
+    ok: Array.isArray(models?.data),
+    detail: Array.isArray(models?.data) ? `返回 ${models.data.length} 个模型` : "返回体缺少 data 数组"
+  });
+  if (settings.model) {
+    tests.push({
+      key: "model",
+      label: "当前模型",
+      ok: modelList.length ? Boolean(modelFound) : true,
+      detail: modelList.length
+        ? modelFound ? `已找到 ${settings.model}` : `模型列表中未找到 ${settings.model}，请确认 LM Studio 当前加载模型名`
+        : "LM Studio 未返回可校验的模型列表，继续执行实际调用测试"
+    });
+  }
+  if (settings.model) {
+    await runTest("structured_no_thinking", "结构化输出 /no_think", async () => {
+      const result = await chat<{ ok: boolean }>(settings, [
+        { role: "system", content: "你用于测试 LM Studio 结构化输出连接。请严格按 schema 返回 JSON。" },
+        { role: "user", content: "返回连接状态 ok 为 true。" }
+      ], "connection_test", connectionSchema);
+      if (result.ok !== true) throw new Error("ok 字段不是 true");
+      return "content 或 reasoning_content 中的 JSON 解析成功";
+    });
+
+    await runTest("structured_thinking", "结构化输出 thinking", async () => {
+      const result = await chat<AssessmentNarrative>(settings, [
+        { role: "system", content: "你是一位英语写作测评老师。请按 schema 返回中文 JSON。" },
+        { role: "user", content: "生成一个极短测评摘要：指出时态需要练习，并给 1 条薄弱点和 1 条建议。" }
+      ], "assessment_narrative", assessmentNarrativeSchema, { thinking: true });
+      validateAssessmentNarrative(result);
+      return "enable_thinking 请求与结构化字段校验通过";
+    });
+
+    await runTest("plain_text", "普通文本追问", async () => {
+      const text = await chatText(settings, [
+        { role: "system", content: "你是英语写作教练。回答必须简短。" },
+        { role: "user", content: "用中文回答：连接测试正常。" }
+      ]);
+      if (!text.trim()) throw new Error("普通文本返回为空");
+      return `无 response_format 的文本回复可读取，返回 ${text.trim().length} 个字符`;
+    });
+
+    await runTest("streaming", "流式结构化输出", async () => {
+      const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+      const messages = assessmentNarrativeMessages({
+        totalQuestions: 1,
+        matrix: DIMENSIONS.map((dimension, index) => ({
+          dimension,
+          score: index === 0 ? 55 : 80,
+          confidence: index === 0 ? 0.4 : 0.8,
+          evidence_count: 1
+        })),
+        findings: ["第 1 题 时态 - 过去式不稳定"]
+      });
+      let activePayload: ChatPayload = {
+        model: settings.model,
+        temperature: settings.temperature,
+        response_format: schemaResponseFormat("assessment_narrative", assessmentNarrativeSchema),
+        messages,
+        enable_thinking: true,
+        stream: true,
+        stream_options: { include_usage: true }
+      };
+      let response = await postChat(endpoint, activePayload);
+      let detail = "stream_options 可用";
+      if (!response.ok) {
+        const errorText = await response.text();
+        if (unsupportedStreamOptions(errorText)) {
+          activePayload = {
+            model: settings.model,
+            temperature: settings.temperature,
+            response_format: activePayload.response_format,
+            messages,
+            enable_thinking: true,
+            stream: true
+          };
+          response = await postChat(endpoint, activePayload);
+          detail = "stream_options 不支持，已验证无 stream_options 流式请求";
+        } else if (unsupportedThinkingParam(errorText)) {
+          activePayload = {
+            model: settings.model,
+            temperature: settings.temperature,
+            response_format: activePayload.response_format,
+            messages,
+            stream: true
+          };
+          response = await postChat(endpoint, activePayload);
+          detail = "enable_thinking 不支持，已验证普通流式请求";
+        } else {
+          throw new Error(`流式请求失败：${response.status} ${errorText}`);
+        }
+      }
+      if (!response.ok) throw new Error(`流式请求失败：${response.status} ${await response.text()}`);
+      const streamed = await readChatStream(response);
+      const content = streamed.content.trim() ? streamed.content : streamed.reasoning;
+      const parsed = parseJson<AssessmentNarrative>(content);
+      validateAssessmentNarrative(parsed);
+      return `${detail}，JSON 流解析成功`;
+    });
+  }
+
+  if (tests.some((item) => !item.ok)) {
+    const failed = tests.filter((item) => !item.ok).map((item) => `${item.label}：${item.detail}`).join("；");
+    throw Object.assign(new Error(`LM Studio 连接测试未全部通过：${failed}`), {
+      connectionTestResult: { models: modelList, modelFound, tests } satisfies ConnectionTestResult
+    });
+  }
+
+  return { models: modelList, modelFound, tests };
 }
 
 export async function generateQuestion(
@@ -678,14 +941,9 @@ export async function generateQuestion(
   previousQuestions: string[] = [],
   regenerateReason = "",
   paperPosition = "",
-  options: { thinking?: boolean } = {}
+  options: { thinking?: boolean; focusSkills?: string[] } = {}
 ): Promise<Question> {
-  const avoidList = previousQuestions
-    .filter(Boolean)
-    .slice(-20)
-    .map((item, index) => `${index + 1}. ${item}`)
-    .join("\n");
-  const parsed = await chat<{ chinese: string; answers: string[]; vocabulary_tips?: string[]; grammar_focus: string; secondary_dimensions?: string[]; skills?: string[]; rubric_points?: string[] }>(settings, [
+  const parsed = await chat<GeneratedQuestionPayload>(settings, [
     {
       role: "system",
       content:
@@ -693,37 +951,190 @@ export async function generateQuestion(
     },
     {
       role: "user",
-      content: `请生成 1 道中译英练习题。
-考查维度：${dimension}
-难度：${difficulty}/100
-要求：
-1. 中文句子自然、适合中文母语者练习英语写作。
-2. 尽量使用初级英语词汇和常见生活场景，避免生僻词、抽象名词、复杂专业表达。题目尽量贴近实际生活场景，不要生搬硬套。
-3. 主要难点必须来自语法结构，而不是词汇理解。
-4. 英文参考答案以短句或中等长度句子为主，不要为了提高难度使用高级词汇。
-5. 参考答案给 1-2 个英文变体；明确说明考查语法点。
-${includeVocabularyTips ? "6. vocabulary_tips 只给 0-5 个关键英文单词原型，例如 go、make、book；禁止给短语、变形、介词搭配、冠词、时态形式、从句结构或任何会透露语法答案的内容。" : "6. 不要返回 vocabulary_tips。"}
-7. 不要生成和已生成题目语义相同、场景相同或句式结构高度相似的题目；更换人物、动作、场景和句法结构。
-8. secondary_dimensions 给 1-3 个本题自然涉及的次要维度，只能从：${DIMENSIONS.join("、")} 中选择，且不能包含主维度。
-9. skills 给 2-4 个具体能力标签，例如“过去完成时识别”“特指冠词”“原因连接”。
-10. rubric_points 给 2-4 条批改要点，覆盖主维度和关键次维度。
-${avoidList ? `已生成题目，必须避开：\n${avoidList}` : "本轮还没有已生成题目。"}
-${regenerateReason ? `用户要求重生成的原因：${regenerateReason}` : ""}
-${paperPosition ? `试卷位置：${paperPosition}。请让本题与同一试卷中其它题在人物、场景、动作和句法结构上明显不同。` : ""}`
+      content: questionGenerationPrompt({
+        count: 1,
+        includeVocabularyTips,
+        previousQuestions,
+        regenerateReason,
+        specs: [{ dimension, difficulty, paperPosition, focusSkills: options.focusSkills }]
+      })
     }
   ], includeVocabularyTips ? "assessment_question" : "practice_question", questionSchema(includeVocabularyTips), options);
+  return normalizeGeneratedQuestion(parsed, dimension, difficulty, includeVocabularyTips);
+}
+
+export async function generateQuestions(
+  settings: Settings,
+  specs: QuestionGenerationSpec[],
+  includeVocabularyTips = false,
+  previousQuestions: string[] = [],
+  regenerateReason = "",
+  options: { thinking?: boolean } = {}
+): Promise<Question[]> {
+  const normalizedSpecs = specs
+    .filter((spec) => DIMENSIONS.includes(spec.dimension))
+    .map((spec) => ({
+      ...spec,
+      difficulty: Math.max(1, Math.min(100, Math.round(Number(spec.difficulty) || 50))),
+      focusSkills: spec.focusSkills?.filter(Boolean).slice(0, 5) ?? []
+    }));
+  if (normalizedSpecs.length < 1) return [];
+  const parsed = await chat<{ questions?: GeneratedQuestionPayload[] }>(settings, [
+    {
+      role: "system",
+      content:
+        "你是一位专业的英语写作训练出题老师，母语为中文。请一次性完成整张试卷出题，并按结构化输出 schema 填写字段。"
+    },
+    {
+      role: "user",
+      content: questionGenerationPrompt({
+        count: normalizedSpecs.length,
+        includeVocabularyTips,
+        previousQuestions,
+        regenerateReason,
+        specs: normalizedSpecs
+      })
+    }
+  ], includeVocabularyTips ? "assessment_question_batch" : "practice_question_batch", questionBatchSchema(includeVocabularyTips, normalizedSpecs.length), options);
+  const questions = parsed.questions ?? [];
+  if (questions.length !== normalizedSpecs.length) {
+    throw new Error(`AI 返回的题目数量不正确：需要 ${normalizedSpecs.length} 道，实际 ${questions.length} 道`);
+  }
+  return questions
+    .map((question, index) => normalizeGeneratedQuestion(
+      question,
+      normalizedSpecs[index].dimension,
+      normalizedSpecs[index].difficulty,
+      includeVocabularyTips
+    ));
+}
+
+function questionGenerationPrompt(input: {
+  count: number;
+  includeVocabularyTips: boolean;
+  previousQuestions: string[];
+  regenerateReason?: string;
+  specs: QuestionGenerationSpec[];
+}) {
+  const avoidList = input.previousQuestions
+    .filter(Boolean)
+    .slice(-20)
+    .map((item, index) => `${index + 1}. ${item}`)
+    .join("\n");
+  const specList = input.specs.map((spec, index) => [
+    `${index + 1}. 考查维度：${spec.dimension}`,
+    `   难度：${spec.difficulty}/100`,
+    spec.paperPosition ? `   试卷位置：${spec.paperPosition}` : "",
+    spec.focusSkills?.length ? `   优先覆盖薄弱技能：${spec.focusSkills.slice(0, 5).join("、")}` : ""
+  ].filter(Boolean).join("\n")).join("\n");
+
+  return `请一次性生成 ${input.count} 道中译英练习题，并按 questions 数组顺序返回。
+每道题的目标：
+${specList}
+
+要求：
+1. 中文句子必须像日常微信、课堂、办公室、家里、路上、购物、吃饭、约时间、请假、催进度、邻里闲聊中真实会说的话；先保证生活化，再考虑语法覆盖。
+2. 尽量使用初级英语词汇和常见生活场景，避免生僻词、抽象名词、复杂专业表达。题目必须贴近实际生活场景，不要生搬硬套。
+3. 主要难点必须来自语法结构，而不是词汇理解。
+4. 每题围绕 1 个主维度即可；只有在不破坏日常表达的前提下，才自然嵌入 1-2 个可独立评分的次要维度。禁止为了凑考点把多个语法结构硬塞进一句话。
+5. 中文题干建议 12-28 个汉字；最多 2 个分句。宁可短而真实，也不要写成长段、复杂叙事或阅读理解题。
+6. 英文参考答案以短句或中等长度句子为主，优先使用常见词；不要为了提高难度使用高级词汇。
+7. 让多个考点共同服务同一个真实表达场景。例如主考被动语态时，可同时嵌入时态、冠词或介词搭配；主考连接词时，可同时嵌入时态、冠词或定语从句。
+8. 避免把多个互不相关的短句机械拼接成一道题；每个次要维度都必须能从用户译文中明确判断对错。
+9. answers 必须且只能给 1 个最佳英文参考答案，不要给第二个变体；即使存在多种自然译法，也只选择最适合作为本题标准答案的一种。
+10. grammar_focus 必须说明主考点和自然嵌入的次要考点，例如“一般过去时 + 时间介词 + 特指冠词”。
+${input.includeVocabularyTips ? "11. vocabulary_tips 只给 0-5 个关键英文单词原型，例如 go、make、book；禁止给短语、变形、介词搭配、冠词、时态形式、从句结构或任何会透露语法答案的内容。" : "11. 不要返回 vocabulary_tips。"}
+12. 不要生成和已生成题目语义相同、场景相同或句式结构高度相似的题目；本次返回的多道题之间也必须更换人物、动作、场景和句法结构。
+13. 生成前先在内部规划整张试卷：家庭、学校、工作、购物、出行、健康、约定、通知、邻里、学习等场景尽量分散；不要连续使用同一种人物关系、时间状语、开头结构或谓语动作。
+14. 每道题的中文题干首词、核心动词、时间表达和英文句型骨架都应尽量不同；禁止通过替换人名或地点来制造表面差异。
+15. secondary_dimensions 给 1-2 个本题自然涉及且可独立评分的次要维度，只能从：${DIMENSIONS.join("、")} 中选择，且不能包含主维度；如果强行加入会让题目像教材例句，宁可只给 1 个。
+16. skills 会在做题前展示给用户，必须公平但不能泄题。写成 2-4 个短中文抽象能力点，禁止出现任何英文字母、英文答案片段、具体介词短语、具体动词变形、过去分词、be 动词选项、完整公式或当前句子的专有内容。例如可写“一般过去时被动语态”“施事者引出”“副词修饰谓语”“习惯表达辨析”，不要写“was/were + past participle”“pass 的过去分词 passed”“by all the shareholders”“because + 主谓结构”“am/is/are doing”“By + 过去时间”“read three chapters”。
+17. 如果某个句式是硬性要求，skills 只能用中文概念点提示，例如“原因状语从句”“现在进行时”“习惯表达辨析”，不要给出完整英文套用公式；rubric_points 可包含内部细则，但不要把 skills 没有明确展示的特定参考句式设为唯一正确答案，自然等价表达应允许得分。
+18. 禁止生成明显教材化、百科化、脱离日常的模板句，例如“世界上最高的山”“2010 年修建的桥”“我见过最漂亮的花”“桌子上有一支红色的笔”“正在唱歌的女孩”“经常穿红衣服的女孩”“这封信由我父亲写的”。如果需要考查同类语法，改成真实场景，例如快递、会议、作业、请假、邻居借东西、同事改文件、朋友约饭、家人提醒等。
+19. 避免连续使用“他/她/那个/这座/这封/当我/虽然/尽管/因为”开头；同一批题要有口语化动作和具体但普通的生活细节。
+${avoidList ? `已生成题目，必须避开：\n${avoidList}` : "本轮还没有已生成题目。"}
+${input.regenerateReason ? `用户要求重生成的原因：${input.regenerateReason}` : ""}`;
+}
+
+function normalizeGeneratedQuestion(
+  parsed: GeneratedQuestionPayload,
+  dimension: Dimension,
+  difficulty: number,
+  includeVocabularyTips: boolean
+): Question {
+  const answers = toTextArray(parsed.answers, ["This question needs a valid reference answer."]).filter(Boolean);
   return {
     chinese: toText(parsed.chinese, "题目生成失败，请重新生成。"),
-    answers: toTextArray(parsed.answers).slice(0, 2),
+    answers: [answers[0] || "This question needs a valid reference answer."],
     vocabulary_tips: includeVocabularyTips ? toVocabularyTips(parsed.vocabulary_tips) : undefined,
     grammar_focus: toText(parsed.grammar_focus, "本题考查指定语法维度。"),
     dimension,
     secondary_dimensions: toDimensions(parsed.secondary_dimensions, dimension),
-    skills: toTextArray(parsed.skills).slice(0, 4),
-    rubric_points: toTextArray(parsed.rubric_points).slice(0, 4),
+    skills: publicQuestionSkills(parsed.skills),
+    rubric_points: toTextArray(parsed.rubric_points).slice(0, 6),
     difficulty,
     source: "ai"
   };
+}
+
+function normalizeDrillCard(parsed: DrillCardPayload, sourceCn: string): DrillCard {
+  const standard = toText(parsed.standard).trim();
+  const dimension = (DIMENSIONS as readonly string[]).includes(String(parsed.grammar_dimension))
+    ? parsed.grammar_dimension as Dimension
+    : "连接词";
+  if (!isMeaningfulText(sourceCn)) throw new Error("中文场景内容过短");
+  if (!isMeaningfulText(standard)) throw new Error("AI 返回的 standard 为空或过短");
+  return {
+    casual: toText(parsed.casual || standard).trim(),
+    standard,
+    vivid: toText(parsed.vivid || standard).trim(),
+    source_cn: sourceCn,
+    reference_en: standard,
+    grammar_dimension: dimension,
+    common_mistake: toText(parsed.common_mistake, `${dimension}相关表达容易直译。`).trim(),
+    memory_hook: toText(parsed.memory_hook, "先想自然英文表达，再检查核心语法。").trim()
+  };
+}
+
+export async function generateDrillCard(settings: Settings, sourceCn: string): Promise<DrillCard> {
+  const trimmedSource = sourceCn.trim();
+  const parsed = await chat<DrillCardPayload>(settings, [
+    {
+      role: "system",
+      content: "你是一位面向中文母语者的英语表达教练。请只输出符合 schema 的 JSON，不要输出 markdown、解释文字或代码块。你的任务是把用户的中文个人场景，转成可练习的英文表达卡。"
+    },
+    {
+      role: "user",
+      content: `中文个人场景：
+${trimmedSource}
+
+请生成一个中译英表达 Drill Card。
+
+要求：
+1. casual 是自然口语版本，适合朋友、同事轻松交流。
+2. standard 是标准版本，清楚、通用、语法稳定；它会作为 reference_en。
+3. vivid 是更生动但不过度高级的版本。
+4. source_cn 必须保留用户原始中文场景，不要改写。
+5. reference_en 必须等于 standard。
+6. grammar_dimension 只能从以下 6 个值中选 1 个：${DIMENSIONS.join("、")}。
+7. common_mistake 写一个中文母语者表达这个场景时最容易犯的具体错误。
+8. memory_hook 写一个和中文概念绑定的简短记忆钩子，帮助用户下次想起正确英文。
+9. 英文表达优先自然、生活化、可复用；不要写教材腔或复杂长句。
+10. 只返回 JSON，结构必须完全如下：
+
+{
+  "casual": "...",
+  "standard": "...",
+  "vivid": "...",
+  "source_cn": "...",
+  "reference_en": "...",
+  "grammar_dimension": "...",
+  "common_mistake": "...",
+  "memory_hook": "..."
+}`
+    }
+  ], "drill_card", drillCardSchema);
+  return normalizeDrillCard(parsed, trimmedSource);
 }
 
 export async function gradeAnswer(settings: Settings, question: Question, userAnswer: string): Promise<GradeResult> {
@@ -739,14 +1150,22 @@ export async function gradeAnswer(settings: Settings, question: Question, userAn
       content: `中文原句：${question.chinese}
 考查维度：${question.dimension}
 次要维度：${question.secondary_dimensions?.join("、") || "无"}
-考查语法点：${question.grammar_focus}
-批改要点：${question.rubric_points?.join("；") || "按题目语法点批改"}
+考查语法点（内部参考，做题前不一定展示）：${question.grammar_focus}
+做题前可见技能标签：${question.skills?.join("、") || "无"}
+批改要点（内部参考，做题前不一定展示）：${question.rubric_points?.join("；") || "按题目语法点批改"}
 参考答案：${question.answers.join(" / ")}
 用户译文：${userAnswer}
 
-请判断：正确、基本正确（有小瑕疵）或错误。即使意思接近，也要指出语法、搭配、冠词、时态、语序等问题。
+请判断：正确、基本正确（仅限非核心小瑕疵）或错误。即使意思接近，也要指出语法、搭配、冠词、时态、语序等问题。
+reference_answers 必须且只能给 1 个最佳英文参考答案，不要给第二个变体；如果原参考答案可用，优先沿用原参考答案，禁止返回空数组。
 dimension_scores 必须覆盖主维度；如果次要维度有明确证据，也要分别给出。score 表示该维度本题表现，不是总能力分，必须使用 0-100 百分制。
-score、verdict、severity 和 notes 必须一致：correct 通常为 80-100，partial 通常为 45-79，wrong 通常为 0-44。如果 notes 指出用户漏用了本题要求的核心语法结构或搭配，不要给 correct。`
+skill_findings 尽量对应“本题技能标签”中的具体技能；如果用户暴露了更具体的薄弱点，也可以补充短标签，不要只写大类薄弱。
+score、verdict、severity 和 notes 必须一致：correct 通常为 80-100，partial 通常为 45-79，wrong 通常为 0-44。
+公平性原则：评分以中文原句、考查维度、做题前可见技能标签为硬标准。grammar_focus、rubric_points 和参考答案只能帮助理解题意，不能把做题前不可见的特定参考句式当成唯一正确答案。
+如果可见技能标签没有明确写出某个固定句式，用户使用自然、语义等价且符合考查维度的表达时，不要仅因未使用参考答案句式而判 wrong。例如“习惯每天做某事”可用 usually do 或 be used to doing；只有可见技能标签明确写出“be used to doing”时，才把该结构作为硬要求。
+冠词/限定词评分要看英文是否自然且语义是否保持，不要机械要求和参考答案完全相同。the/that/this/these/those/my 等限定词可能都能表达特指；例如 “that girl who always wears a red dress” 可以自然对应“那个总是穿红裙子的女孩”，不能仅因参考答案是 “the girl who...” 就判错。
+如果用户漏用了做题前可见且明确要求的核心语法结构、固定搭配、必要介词/冠词/时态，或改用了题目没有要求的句式，即使意思接近也必须判 wrong，不要判 partial。
+partial 只用于核心考点已经正确、但存在不影响目标结构的小拼写、自然度或次要表达瑕疵。`
     }
   ], "grade_result", gradeSchema(question.dimension));
   const dimensionScores = normalizeDimensionScores(parsed.dimension_scores, question.dimension);
@@ -754,13 +1173,63 @@ score、verdict、severity 和 notes 必须一致：correct 通常为 80-100，p
   return {
     verdict: normalizeGradeVerdict(verdict, dimensionScores, question.dimension),
     error_types: toTextArray(parsed.error_types),
-    reference_answers: toTextArray(parsed.reference_answers, question.answers).slice(0, 2),
+    reference_answers: [toTextArray(parsed.reference_answers, question.answers)[0] || question.answers[0] || "No reference answer was provided."],
     differences: toTextArray(parsed.differences),
     explanations: toTextArray(parsed.explanations),
     memory_tip: parsed.memory_tip ? toText(parsed.memory_tip) : undefined,
     dimension_scores: dimensionScores,
     skill_findings: toTextArray(parsed.skill_findings).slice(0, 6)
   };
+}
+
+export async function answerQuestionFollowUp(
+  settings: Settings,
+  question: Question,
+  userAnswer: string,
+  result: GradeResult,
+  messages: FollowUpMessage[],
+  prompt: string
+): Promise<string> {
+  const safeMessages = messages
+    .filter((message) => message.content.trim())
+    .slice(-8)
+    .map((message) => ({
+      role: message.role,
+      content: message.content.trim().slice(0, 1200)
+    }));
+  const chatMessages: ChatMessage[] = [
+    {
+      role: "system",
+      content: `你是一位耐心、严格的中译英写作教练，母语为中文。
+只围绕当前题目、用户译文、参考答案和批改结果回答追问。
+回答要简洁具体，必要时给出改写后的英文句子和原因；不要生成新题，不要改写能力报告。`
+    },
+    {
+      role: "user",
+      content: `当前题目上下文：
+中文原句：${question.chinese}
+考查维度：${question.dimension}
+次要维度：${question.secondary_dimensions?.join("、") || "无"}
+考查语法点：${question.grammar_focus}
+批改要点：${question.rubric_points?.join("；") || "按题目语法点批改"}
+最佳参考答案：${result.reference_answers[0] || question.answers[0] || "无"}
+用户译文：${userAnswer}
+批改结论：${result.verdict}
+错误类型：${result.error_types.join("、") || "无"}
+差异：${result.differences.join("；") || "无"}
+解释：${result.explanations.join("；") || "无"}
+记忆技巧：${result.memory_tip || "无"}`
+    },
+    ...safeMessages.map((message): ChatMessage => ({
+      role: message.role,
+      content: message.content
+    })),
+    {
+      role: "user",
+      content: prompt.trim().slice(0, 1200)
+    }
+  ];
+  return chatText(settings, chatMessages);
 }
 
 export async function generateStudyGuide(

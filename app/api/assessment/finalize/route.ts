@@ -1,6 +1,6 @@
-import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getSettings, initDb, setAbility } from "@/lib/db";
+import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getSettings, getSkillAbilities, initDb, setAbility, setSkillAbility } from "@/lib/db";
 import { generateAssessmentNarrativeStream } from "@/lib/llm";
-import { assessmentFindings, calculateAssessmentMatrix, mergeAssessmentScore } from "@/lib/assessment";
+import { assessmentEvidenceDetails, assessmentFindings, calculateAssessmentMatrix, calculateAssessmentSkillAbilityUpdates, mergeAssessmentScore } from "@/lib/assessment";
 import { Dimension } from "@/lib/types";
 
 export async function POST(request: Request) {
@@ -21,6 +21,7 @@ export async function POST(request: Request) {
 
         const matrix = calculateAssessmentMatrix(records);
         const findings = assessmentFindings(records);
+        const evidenceDetails = assessmentEvidenceDetails(records);
         send("matrix", {
           title: "能力矩阵已计算",
           detail: `已汇总 ${records.length} 道题和 ${findings.length} 条典型证据。`,
@@ -38,7 +39,8 @@ export async function POST(request: Request) {
         const narrative = await generateAssessmentNarrativeStream(getSettings(), {
           totalQuestions: records.length,
           matrix,
-          findings
+          findings,
+          evidence_details: evidenceDetails
         }, (progress) => {
           const now = Date.now();
           if (!progress.finalTokens && now - lastProgressAt < 200) return;
@@ -64,10 +66,17 @@ export async function POST(request: Request) {
         });
 
         const currentAbilities = getAbilities();
-        const initializing = currentAbilities.every((item) => item.score === 0);
+        const initializing = currentAbilities.every((item) => item.evidence_count === 0);
         for (const item of matrix) {
-          const current = currentAbilities.find((ability) => ability.dimension === item.dimension)?.score ?? 0;
-          setAbility(item.dimension as Dimension, mergeAssessmentScore(current, item.score, item.confidence, initializing));
+          const current = currentAbilities.find((ability) => ability.dimension === item.dimension);
+          setAbility(
+            item.dimension as Dimension,
+            mergeAssessmentScore(current?.score ?? 50, item.score, item.confidence, initializing),
+            (current?.evidence_count ?? 0) + item.evidence_count
+          );
+        }
+        for (const update of calculateAssessmentSkillAbilityUpdates(getSkillAbilities(), records)) {
+          setSkillAbility(update);
         }
 
         const createdAt = new Date().toISOString();
@@ -95,7 +104,8 @@ export async function POST(request: Request) {
             recommendations: narrative.recommendations,
             created_at: createdAt
           },
-          abilities: getAbilities()
+          abilities: getAbilities(),
+          skillAbilities: getSkillAbilities()
         });
       } catch (error) {
         console.error("POST /api/assessment/finalize failed", error);
