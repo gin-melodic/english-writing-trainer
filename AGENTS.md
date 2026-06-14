@@ -5,7 +5,9 @@
 - For verification, prefer lint/tests only.
 - Do not run extra production builds unless the user explicitly asks for a build.
 
-## LM Studio / Qwen Notes
+## GLM-4.7-Flash / Z.ai Notes
 
-- `qwen3.6-35b-a3b` through LM Studio may return structured JSON in `message.reasoning_content` while `message.content` is an empty string, even for requests where thinking is disabled or not explicitly requested.
-- Keep LLM parsing compatible with this shape: prefer `message.content`, but if it is empty, fall back to `message.reasoning_content` before treating the response as invalid JSON.
+- The app uses Z.ai/Zhipu GLM-4.7-Flash through `https://open.bigmodel.cn/api/paas/v4/chat/completions`.
+- Read the API key from `.env` as `ZAI_API_KEY`; do not store or expose it in Settings.
+- GLM-4.7-Flash free tier concurrency is limited to 1; keep application LLM concurrency fixed at 1.
+- GLM structured output uses `response_format: { "type": "json_object" }`; include the expected JSON schema in the prompt and validate/normalize locally.

@@ -1,16 +1,42 @@
 import { NextResponse } from "next/server";
-import { getSettings, initDb } from "@/lib/db";
+import { getRuntimeSettings, initDb } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { ConnectionTestResult, testConnection } from "@/lib/llm";
 import { Settings } from "@/lib/types";
 
-function normalizeSettings(settings: Settings): Settings {
+type SettingsTestTarget = "global" | "personal";
+
+function normalizeGlobalSettings(settings: Settings & { userId?: number }) {
   return {
-    baseUrl: settings.baseUrl || "http://localhost:1234",
-    model: settings.model || "",
+    baseUrl: settings.baseUrl || "https://open.bigmodel.cn/api/paas/v4",
+    model: settings.model || "glm-4.7-flash",
     temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
     dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
-    maxConcurrentPredictions: Math.min(10, Math.max(1, Number(settings.maxConcurrentPredictions) || 5))
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: false,
+    personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
+    personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
+    hasPersonalApiKey: false,
+    userId: settings.userId
+  };
+}
+
+function normalizePersonalSettings(settings: Settings & { personalApiKey?: string; userId?: number }) {
+  const personalApiKey = settings.personalApiKey?.trim();
+  const hasPersonalApiKey = Boolean(settings.hasPersonalApiKey || personalApiKey);
+  if (!personalApiKey) throw new Error("请先填写或保存 SiliconFlow API Key");
+  return {
+    baseUrl: settings.baseUrl || "https://open.bigmodel.cn/api/paas/v4",
+    model: settings.model || "glm-4.7-flash",
+    temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
+    dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: hasPersonalApiKey,
+    personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
+    personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
+    hasPersonalApiKey,
+    personalApiKey,
+    userId: settings.userId
   };
 }
 
@@ -23,9 +49,24 @@ export async function POST(request: Request) {
   try {
     initDb();
     const user = requireUser(request);
-    if (user.role !== "admin") return NextResponse.json({ message: "需要管理员权限。" }, { status: 403 });
     const body = await request.json().catch(() => undefined);
-    const settings = normalizeSettings({ ...getSettings(user.id), ...(body && typeof body === "object" ? body : {}) });
+    const bodyObject = body && typeof body === "object" ? body as Partial<Settings> & { personalApiKey?: string; target?: SettingsTestTarget } : {};
+    const target: SettingsTestTarget = bodyObject.target === "global" || bodyObject.target === "personal"
+      ? bodyObject.target
+      : user.role === "admin" ? "global" : "personal";
+    if (target === "global" && user.role !== "admin") {
+      return NextResponse.json({ message: "需要管理员权限。" }, { status: 403 });
+    }
+    const current = getRuntimeSettings(user.id);
+    const bodyPersonalApiKey = bodyObject.personalApiKey?.trim();
+    const merged = {
+      ...current,
+      ...bodyObject,
+      personalApiKey: bodyPersonalApiKey || current.personalApiKey
+    };
+    const settings = target === "personal"
+      ? normalizePersonalSettings(merged)
+      : normalizeGlobalSettings(merged);
     const result = await testConnection(settings);
     return NextResponse.json({ ok: true, ...result });
   } catch (error) {

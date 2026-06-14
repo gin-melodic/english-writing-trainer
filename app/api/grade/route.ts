@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { calculatePracticeAbilityUpdates, calculatePracticeSkillAbilityUpdates } from "@/lib/assessment";
-import { addMistake, getAbilities, getSettings, getSkillAbilities, initDb, recordQuestionAnswer, setAbility, setSkillAbility, updateCapturedDrillStreak, updateMistakeStreak, updateSession } from "@/lib/db";
+import { addMistake, getAbilities, getRuntimeSettings, getSkillAbilities, initDb, recordQuestionAnswer, setAbility, setSkillAbility, updateCapturedDrillStreak, updateMistakeStreak, updateSession } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { gradeAnswer } from "@/lib/llm";
 import { publicQuestionSkills } from "@/lib/questionSafety";
@@ -19,7 +19,7 @@ export async function POST(request: Request) {
       durationSeconds?: number;
     };
     const safeQuestion: Question = { ...question, skills: publicQuestionSkills(question.skills) };
-    const result = await gradeAnswer(getSettings(user.id), safeQuestion, answer);
+    const result = await gradeAnswer(getRuntimeSettings(user.id), safeQuestion, answer);
     const correct = result.verdict === "correct";
     const normalizedMode = String(mode || "每日练习");
 

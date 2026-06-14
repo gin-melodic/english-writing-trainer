@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { addCapturedDrill, getSettings, initDb } from "@/lib/db";
+import { addCapturedDrill, getRuntimeSettings, initDb } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateDrillCard } from "@/lib/llm";
 import { DIMENSIONS } from "@/lib/types";
@@ -49,7 +49,7 @@ export async function POST(request: Request) {
 
     if (action === "generate") {
       const sourceCn = validateSourceCn(body.source_cn);
-      const card = await generateDrillCard(getSettings(user.id), sourceCn);
+      const card = await generateDrillCard(getRuntimeSettings(user.id), sourceCn);
       return NextResponse.json({ card });
     }
 
@@ -61,7 +61,7 @@ export async function POST(request: Request) {
 
     if (action === "generate_and_save") {
       const sourceCn = validateSourceCn(body.source_cn);
-      const card = await generateDrillCard(getSettings(user.id), sourceCn);
+      const card = await generateDrillCard(getRuntimeSettings(user.id), sourceCn);
       const id = addCapturedDrill(card, user.id);
       return NextResponse.json({ id, card });
     }

@@ -8,6 +8,10 @@ export type Settings = {
   temperature: number;
   dailyCount: number;
   maxConcurrentPredictions: number;
+  personalProviderEnabled: boolean;
+  personalBaseUrl: string;
+  personalModel: string;
+  hasPersonalApiKey: boolean;
 };
 
 export type Ability = {

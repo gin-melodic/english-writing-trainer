@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAbilities, getCapturedDrillQuestions, getMistakes, getSettings, getSkillAbilities, initDb } from "@/lib/db";
+import { getAbilities, getCapturedDrillQuestions, getMistakes, getRuntimeSettings, getSkillAbilities, initDb } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { chooseAdaptiveDifficulty, chooseLowestDimension, generateQuestion, generateQuestions } from "@/lib/llm";
 import { DIMENSIONS, Dimension, Question } from "@/lib/types";
@@ -88,7 +88,7 @@ export async function POST(request: Request) {
           return { dimension, difficulty, focusSkills, paperPosition };
         });
       const useThinking = mode === "能力测评" && Boolean(body.thinking);
-      const questions = await generateQuestions(getSettings(user.id), specs, true, previousQuestions, regenerateReason, { thinking: useThinking });
+      const questions = await generateQuestions(getRuntimeSettings(user.id), specs, true, previousQuestions, regenerateReason, { thinking: useThinking });
       console.log("Generated question batch", { mode, count: specs.length, thinking: useThinking, specs, previousQuestions, regenerateReason });
       return NextResponse.json({ questions });
     }
@@ -111,7 +111,7 @@ export async function POST(request: Request) {
           .map((item) => item.skill)
           .slice(0, 5)
         : [];
-    const question = await generateQuestion(getSettings(user.id), dimension, difficulty, true, previousQuestions, regenerateReason, paperPosition, { thinking: useThinking, focusSkills: weakSkills });
+    const question = await generateQuestion(getRuntimeSettings(user.id), dimension, difficulty, true, previousQuestions, regenerateReason, paperPosition, { thinking: useThinking, focusSkills: weakSkills });
     console.log("Prompt for question generation", { dimension, difficulty, thinking: useThinking, focusSkills: weakSkills, previousQuestions, regenerateReason, paperPosition });
     console.log("Generated question", { dimension, difficulty, thinking: useThinking, focusSkills: weakSkills, question });
     return NextResponse.json({ question });

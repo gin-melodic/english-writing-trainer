@@ -1,13 +1,23 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { calculateAssessmentSkillAbilityUpdates, calculatePracticeReport } from "./assessment";
 import { Ability, AbilityHistory, AssessmentMatrixItem, AssessmentReport, CapturedDrill, DIMENSIONS, Dimension, DrillCard, GradeResult, Mistake, PracticeReport, Question, QuestionAnswerRecord, Settings, SkillAbility, TrainingRecord } from "./types";
 
 const DB_PATH = join(process.cwd(), "data", "trainer.db");
 const DEFAULT_USER_ID = 1;
 const SESSION_DAYS = 30;
+const DEFAULT_GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
+const DEFAULT_GLM_MODEL = "glm-4.7-flash";
+const DEFAULT_PERSONAL_BASE_URL = "https://api.siliconflow.cn/v1";
+const DEFAULT_PERSONAL_MODEL = "deepseek-ai/DeepSeek-V4-Flash";
+const LEGACY_LM_STUDIO_BASE_URLS = new Set([
+  "http://localhost:1234",
+  "http://127.0.0.1:1234"
+]);
+const SQLITE_BUSY_TIMEOUT_MS = 5000;
+let dbInitialized = false;
 
 export type UserRole = "admin" | "user";
 
@@ -52,7 +62,7 @@ function sqlQuote(value: unknown) {
 
 function runSql(sql: string, json = false) {
   mkdirSync(dirname(DB_PATH), { recursive: true });
-  const args = json ? ["-json", DB_PATH, sql] : [DB_PATH, sql];
+  const args = ["-cmd", `.timeout ${SQLITE_BUSY_TIMEOUT_MS}`, ...(json ? ["-json"] : []), DB_PATH, sql];
   const result = spawnSync("sqlite3", args, { encoding: "utf8" });
   if (result.status !== 0) {
     throw new Error(result.stderr || "SQLite 执行失败");
@@ -90,6 +100,35 @@ function hashPassword(password: string) {
   return `scrypt$${salt}$${key}`;
 }
 
+function userApiKeyEncryptionSecret() {
+  return process.env.USER_API_KEY_ENCRYPTION_SECRET?.trim() || "";
+}
+
+function userApiKeyEncryptionKey() {
+  const secret = userApiKeyEncryptionSecret();
+  if (!secret) throw new AuthError("缺少 USER_API_KEY_ENCRYPTION_SECRET，无法保存个人 API Key。", 500);
+  return createHash("sha256").update(secret).digest();
+}
+
+function encryptUserApiKey(apiKey: string) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", userApiKeyEncryptionKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(apiKey, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return ["v1", iv.toString("base64url"), tag.toString("base64url"), encrypted.toString("base64url")].join(":");
+}
+
+function decryptUserApiKey(value: string) {
+  const [version, ivText, tagText, encryptedText] = value.split(":");
+  if (version !== "v1" || !ivText || !tagText || !encryptedText) return "";
+  const decipher = createDecipheriv("aes-256-gcm", userApiKeyEncryptionKey(), Buffer.from(ivText, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagText, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encryptedText, "base64url")),
+    decipher.final()
+  ]).toString("utf8");
+}
+
 export function verifyPassword(password: string, passwordHash: string) {
   const [algorithm, salt, key] = passwordHash.split("$");
   if (algorithm !== "scrypt" || !salt || !key) return false;
@@ -114,6 +153,10 @@ function ensureSettingsDefaults() {
 }
 
 export function initDb() {
+  if (dbInitialized) {
+    ensureAdminUser();
+    return;
+  }
   runSql(`
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS users (
@@ -277,6 +320,7 @@ CREATE TABLE IF NOT EXISTS assessment_reports (
   ensureSettingsDefaults();
   ensureAdminUser();
   cleanupExpiredSessions();
+  dbInitialized = true;
 }
 
 export function validateUsername(username: string) {
@@ -463,35 +507,77 @@ export function resetUserPassword(id: number, password: string) {
 
 export function getSettings(userId = DEFAULT_USER_ID): Settings {
   const defaults: Settings = {
-    baseUrl: "http://localhost:1234",
-    model: "",
+    baseUrl: DEFAULT_GLM_BASE_URL,
+    model: DEFAULT_GLM_MODEL,
     temperature: 0.3,
     dailyCount: 20,
-    maxConcurrentPredictions: 5
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: false,
+    personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
+    personalModel: DEFAULT_PERSONAL_MODEL,
+    hasPersonalApiKey: false
   };
-  const data = rows<{ key: keyof Settings; value: string }>("SELECT key, value FROM settings;");
+  const data = rows<{ key: string; value: string }>("SELECT key, value FROM settings;");
   for (const item of data) {
-    if (item.key === "temperature" || item.key === "maxConcurrentPredictions") {
-      (defaults[item.key] as number) = Number(item.value);
-    } else if (item.key !== "dailyCount") {
-      defaults[item.key] = item.value;
-    }
+    if (item.key === "temperature") defaults.temperature = Number(item.value);
+    if (item.key === "maxConcurrentPredictions") defaults.maxConcurrentPredictions = Number(item.value);
+    if (item.key === "baseUrl") defaults.baseUrl = item.value;
+    if (item.key === "model") defaults.model = item.value;
   }
-  const [daily] = rows<{ value: string }>(`
-SELECT value FROM user_settings WHERE user_id = ${Number(userId)} AND key = 'dailyCount' LIMIT 1;
+  if (LEGACY_LM_STUDIO_BASE_URLS.has(defaults.baseUrl.replace(/\/$/, ""))) {
+    defaults.baseUrl = DEFAULT_GLM_BASE_URL;
+  }
+  if (!defaults.model.trim() || /^qwen/i.test(defaults.model.trim())) {
+    defaults.model = DEFAULT_GLM_MODEL;
+  }
+  defaults.maxConcurrentPredictions = 1;
+  const userRows = rows<{ key: string; value: string }>(`
+SELECT key, value FROM user_settings WHERE user_id = ${Number(userId)};
 `);
-  if (daily) defaults.dailyCount = Number(daily.value);
+  for (const item of userRows) {
+    if (item.key === "dailyCount") defaults.dailyCount = Number(item.value);
+    if (item.key === "personalBaseUrl") defaults.personalBaseUrl = item.value || DEFAULT_PERSONAL_BASE_URL;
+    if (item.key === "personalModel") defaults.personalModel = item.value || DEFAULT_PERSONAL_MODEL;
+    if (item.key === "personalApiKeyEncrypted") defaults.hasPersonalApiKey = Boolean(item.value);
+  }
+  defaults.personalProviderEnabled = defaults.hasPersonalApiKey;
   return defaults;
 }
 
-export function setSettings(settings: Settings, actorRole: UserRole = "user", userId = DEFAULT_USER_ID) {
+export function getUserPersonalApiKey(userId = DEFAULT_USER_ID) {
+  const [row] = rows<{ value: string }>(`
+SELECT value FROM user_settings WHERE user_id = ${Number(userId)} AND key = 'personalApiKeyEncrypted' LIMIT 1;
+`);
+  if (!row?.value) return "";
+  return decryptUserApiKey(row.value);
+}
+
+export type RuntimeSettings = Settings & {
+  personalApiKey?: string;
+  userId: number;
+};
+
+export function getRuntimeSettings(userId = DEFAULT_USER_ID): RuntimeSettings {
+  const settings = getSettings(userId) as RuntimeSettings;
+  settings.userId = userId;
+  if (settings.hasPersonalApiKey) {
+    settings.personalApiKey = getUserPersonalApiKey(userId);
+  }
+  return settings;
+}
+
+export function setSettings(settings: Settings & { personalApiKey?: string; clearPersonalApiKey?: boolean }, actorRole: UserRole = "user", userId = DEFAULT_USER_ID) {
   const current = getSettings(userId);
   const normalized: Settings = {
-    baseUrl: actorRole === "admin" ? settings.baseUrl || "http://localhost:1234" : current.baseUrl,
-    model: actorRole === "admin" ? settings.model || "" : current.model,
+    baseUrl: actorRole === "admin" ? settings.baseUrl || DEFAULT_GLM_BASE_URL : current.baseUrl,
+    model: actorRole === "admin" ? settings.model || DEFAULT_GLM_MODEL : current.model,
     temperature: actorRole === "admin" ? Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)) : current.temperature,
     dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
-    maxConcurrentPredictions: actorRole === "admin" ? Math.min(10, Math.max(1, Number(settings.maxConcurrentPredictions) || 5)) : current.maxConcurrentPredictions
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: current.hasPersonalApiKey || Boolean(settings.personalApiKey?.trim()),
+    personalBaseUrl: String(settings.personalBaseUrl || DEFAULT_PERSONAL_BASE_URL).trim() || DEFAULT_PERSONAL_BASE_URL,
+    personalModel: String(settings.personalModel || DEFAULT_PERSONAL_MODEL).trim() || DEFAULT_PERSONAL_MODEL,
+    hasPersonalApiKey: current.hasPersonalApiKey
   };
   if (actorRole === "admin") {
     const globalEntries = [
@@ -507,6 +593,29 @@ export function setSettings(settings: Settings, actorRole: UserRole = "user", us
   runSql(`
 INSERT OR REPLACE INTO user_settings(user_id, key, value)
 VALUES (${Number(userId)}, 'dailyCount', ${sqlQuote(normalized.dailyCount)});
+`);
+  const userEntries = [
+    ["personalProviderEnabled", normalized.personalProviderEnabled ? "true" : "false"],
+    ["personalBaseUrl", normalized.personalBaseUrl],
+    ["personalModel", normalized.personalModel]
+  ]
+    .map(([key, value]) => `(${Number(userId)}, ${sqlQuote(key)}, ${sqlQuote(value)})`)
+    .join(",");
+  runSql(`INSERT OR REPLACE INTO user_settings(user_id, key, value) VALUES ${userEntries};`);
+  if (settings.clearPersonalApiKey) {
+    runSql(`DELETE FROM user_settings WHERE user_id = ${Number(userId)} AND key = 'personalApiKeyEncrypted';`);
+    normalized.personalProviderEnabled = false;
+  }
+  if (typeof settings.personalApiKey === "string" && settings.personalApiKey.trim()) {
+    runSql(`
+INSERT OR REPLACE INTO user_settings(user_id, key, value)
+VALUES (${Number(userId)}, 'personalApiKeyEncrypted', ${sqlQuote(encryptUserApiKey(settings.personalApiKey.trim()))});
+`);
+    normalized.personalProviderEnabled = true;
+  }
+  runSql(`
+INSERT OR REPLACE INTO user_settings(user_id, key, value)
+VALUES (${Number(userId)}, 'personalProviderEnabled', ${sqlQuote(normalized.personalProviderEnabled ? "true" : "false")});
 `);
 }
 
@@ -595,7 +704,17 @@ DELETE FROM question_answers WHERE user_id = ${Number(userId)};
 DELETE FROM assessment_reports WHERE user_id = ${Number(userId)};
 DELETE FROM user_settings WHERE user_id = ${Number(userId)};
 `);
-  setSettings({ baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20, maxConcurrentPredictions: 5 }, "admin", userId);
+  setSettings({
+    baseUrl: DEFAULT_GLM_BASE_URL,
+    model: DEFAULT_GLM_MODEL,
+    temperature: 0.3,
+    dailyCount: 20,
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: false,
+    personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
+    personalModel: DEFAULT_PERSONAL_MODEL,
+    hasPersonalApiKey: false
+  }, "admin", userId);
 }
 
 export function getHistory(userId = DEFAULT_USER_ID): AbilityHistory[] {

@@ -1,5 +1,6 @@
 import { DIMENSIONS, Dimension, DimensionScore, DrillCard, FollowUpMessage, GradeResult, Question, Settings, StudyGuide } from "./types";
 import { publicQuestionSkills } from "./questionSafety";
+import { enqueue } from "./llmQueue";
 
 function stripCodeFence(text: string) {
   return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
@@ -180,19 +181,18 @@ type ChatPayload = {
   model: string;
   temperature: number;
   response_format?: {
-    type: "json_schema";
-    json_schema: {
-      name: string;
-      schema: JsonSchema;
-    };
+    type: "json_object";
   };
   messages: ChatMessage[];
-  enable_thinking?: boolean;
-  stream?: boolean;
-  stream_options?: {
-    include_usage?: boolean;
-    continuous_usage_stats?: boolean;
+  thinking?: {
+    type: "enabled" | "disabled";
   };
+  stream?: boolean;
+};
+
+type RuntimeSettings = Settings & {
+  userId?: number;
+  personalApiKey?: string;
 };
 
 type AssessmentNarrative = {
@@ -209,8 +209,6 @@ export type ConnectionTestItem = {
 };
 
 export type ConnectionTestResult = {
-  models: unknown[];
-  modelFound: boolean | null;
   tests: ConnectionTestItem[];
 };
 
@@ -220,31 +218,100 @@ export type AssessmentNarrativeStreamProgress = {
   tokensPerSecond: number;
   finalTokens?: number;
   fallback?: boolean;
+  deltaContent?: string;
+  deltaReasoning?: string;
 };
 
-function withoutThinking(messages: ChatMessage[]) {
-  const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
-  if (lastUserIndex < 0) return messages;
-  return messages.map((message, index) => index === lastUserIndex
-    ? { ...message, content: `/no_think\n${message.content}\n/no_think` }
-    : message
-  );
+function chatEndpoint(settings: RuntimeSettings) {
+  const baseUrl = usePersonalProvider(settings) ? settings.personalBaseUrl : settings.baseUrl;
+  return `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 }
 
-function unsupportedThinkingParam(errorText: string) {
-  return /enable_?thinking/i.test(errorText);
+function getZaiApiKey() {
+  return process.env.ZAI_API_KEY?.trim()
+    || process.env.ZHIPU_API_KEY?.trim()
+    || process.env.BIGMODEL_API_KEY?.trim()
+    || "";
 }
 
-function unsupportedStreamOptions(errorText: string) {
-  return /stream_options|include_usage|continuous_usage_stats/i.test(errorText);
+function usePersonalProvider(settings: RuntimeSettings) {
+  return Boolean(settings.personalProviderEnabled && settings.personalApiKey);
 }
 
-async function postChat(endpoint: string, payload: ChatPayload) {
-  return fetch(endpoint, {
+function ensureChatSettings(settings: RuntimeSettings) {
+  if (usePersonalProvider(settings)) {
+    if (!settings.personalBaseUrl) throw new Error("请先填写 SiliconFlow API 地址");
+    if (!settings.personalModel) throw new Error("请先填写 SiliconFlow 模型名称");
+    if (!settings.personalApiKey) throw new Error("请先保存 SiliconFlow API Key");
+    return;
+  }
+  if (!getZaiApiKey()) throw new Error("请先在 .env 中填写 ZAI_API_KEY");
+  if (!settings.model) throw new Error("请先在设置页填写 GLM 模型名称");
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function glmRequestTimeoutMs() {
+  const parsed = Number(process.env.GLM_REQUEST_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 90000;
+}
+
+function providerPayload(settings: RuntimeSettings, payload: ChatPayload): ChatPayload {
+  const model = usePersonalProvider(settings) ? settings.personalModel : settings.model;
+  const next: ChatPayload = {
+    ...payload,
+    model
+  };
+  if (usePersonalProvider(settings)) {
+    delete next.thinking;
+  }
+  return next;
+}
+
+async function fetchChat(settings: RuntimeSettings, payload: ChatPayload) {
+  const apiKey = usePersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
+  const response = await fetch(chatEndpoint(settings), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    signal: AbortSignal.timeout(glmRequestTimeoutMs()),
     body: JSON.stringify(payload)
   });
+  if (response.status !== 429) return response;
+  const errorText = await response.text();
+  const retryAfter = Number(response.headers.get("retry-after"));
+  throw Object.assign(new Error(`GLM 请求限流：${errorText}`), {
+    retryable: true,
+    status: response.status,
+    errorText,
+    retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined
+  });
+}
+
+async function postChat(settings: RuntimeSettings, payload: ChatPayload) {
+  const run = async () => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await fetchChat(settings, providerPayload(settings, payload));
+      } catch (error) {
+        lastError = error;
+        const retryable = Boolean((error as { retryable?: boolean })?.retryable)
+          || (error instanceof Error && /Timeout|UND_ERR_HEADERS_TIMEOUT|fetch failed/i.test(error.message));
+        if (!retryable || attempt === 2) throw error;
+        const retryAfterMs = (error as { retryAfterMs?: number })?.retryAfterMs;
+        await delay(retryAfterMs ?? 20000 * (attempt + 1));
+      }
+    }
+    throw lastError;
+  };
+  return usePersonalProvider(settings)
+    ? run()
+    : enqueue(run, settings.userId);
 }
 
 function contentBlockToText(value: unknown) {
@@ -283,14 +350,18 @@ function extractStreamDelta(data: unknown) {
   };
 }
 
-function schemaResponseFormat(name: string, schema: JsonSchema): ChatPayload["response_format"] {
-  return {
-    type: "json_schema",
-    json_schema: {
-      name,
-      schema
-    }
-  };
+function jsonResponseFormat(): ChatPayload["response_format"] {
+  return { type: "json_object" };
+}
+
+function withJsonSchemaInstruction(messages: ChatMessage[], schemaName: string, schema: JsonSchema) {
+  const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
+  const instruction = `\n\n请只输出一个合法 JSON 对象，不要输出 markdown、解释或额外文本。JSON 对象必须符合以下 ${schemaName} schema：\n${JSON.stringify(schema)}`;
+  if (lastUserIndex < 0) return messages;
+  return messages.map((message, index) => index === lastUserIndex
+    ? { ...message, content: `${message.content}${instruction}` }
+    : message
+  );
 }
 
 const dimensionSchema = { type: "string", enum: DIMENSIONS };
@@ -655,6 +726,14 @@ function estimateGeneratedTokens(text: string) {
   return Math.max(1, Math.ceil(text.length / 2));
 }
 
+function elapsedMsSince(startedAt: number) {
+  return Date.now() - startedAt;
+}
+
+function formatChatMessagesForLog(messages: ChatMessage[]) {
+  return messages.map((message) => `${message.role}:\n${message.content}`).join("\n\n---\n\n");
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string" && item.trim());
 }
@@ -671,7 +750,7 @@ async function readChatStream(
   res: Response,
   onProgress?: (progress: AssessmentNarrativeStreamProgress) => void
 ) {
-  if (!res.body) throw new Error("LM Studio 流式响应为空");
+  if (!res.body) throw new Error("GLM 流式响应为空");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const startedAt = Date.now();
@@ -701,7 +780,9 @@ async function readChatStream(
       generatedChars: generatedText.length,
       estimatedTokens,
       tokensPerSecond: Number((estimatedTokens / elapsedSeconds).toFixed(1)),
-      finalTokens
+      finalTokens,
+      deltaContent: delta.content || undefined,
+      deltaReasoning: delta.reasoning || undefined
     });
     return false;
   }
@@ -723,42 +804,25 @@ async function readChatStream(
 }
 
 async function chat<T>(settings: Settings, messages: ChatMessage[], schemaName: string, schema: JsonSchema, options: { thinking?: boolean } = {}): Promise<T> {
-  if (!settings.model) throw new Error("请先在设置页填写 LM Studio 模型名称");
-  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+  ensureChatSettings(settings);
   const thinking = Boolean(options.thinking);
   const payload: ChatPayload = {
     model: settings.model,
     temperature: settings.temperature,
-    response_format: schemaResponseFormat(schemaName, schema),
-    messages: thinking ? messages : withoutThinking(messages),
-    enable_thinking: thinking
+    response_format: jsonResponseFormat(),
+    messages: withJsonSchemaInstruction(messages, schemaName, schema),
+    thinking: { type: thinking ? "enabled" : "disabled" }
   };
-  let activePayload = payload;
-  let res = await postChat(endpoint, activePayload);
-  let errorText = "";
+  const res = await postChat(settings, payload);
   if (!res.ok) {
-    errorText = await res.text();
-    // 部分 OpenAI-compatible 服务会拒绝 LM Studio/Qwen thinking 扩展字段。
-    if (unsupportedThinkingParam(errorText)) {
-      activePayload = {
-        model: activePayload.model,
-        temperature: activePayload.temperature,
-        response_format: activePayload.response_format,
-        messages: activePayload.messages
-      };
-      res = await postChat(endpoint, activePayload);
-      errorText = res.ok ? "" : await res.text();
-    }
-  }
-  if (!res.ok) {
-    throw new Error(`LM Studio 请求失败：${res.status} ${errorText}`);
+    throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
   }
   const data = await res.json();
   const content = extractContent(data);
   try {
     return parseJson<T>(content);
   } catch (error) {
-    console.error("LM Studio structured output parse failed", {
+    console.error("GLM structured output parse failed", {
       schemaName,
       content: preview(content),
       response: preview(data)
@@ -768,29 +832,15 @@ async function chat<T>(settings: Settings, messages: ChatMessage[], schemaName: 
 }
 
 async function chatText(settings: Settings, messages: ChatMessage[]): Promise<string> {
-  if (!settings.model) throw new Error("请先在设置页填写 LM Studio 模型名称");
-  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
-  let activePayload: ChatPayload = {
+  ensureChatSettings(settings);
+  const payload: ChatPayload = {
     model: settings.model,
     temperature: settings.temperature,
-    messages: withoutThinking(messages),
-    enable_thinking: false
+    messages,
+    thinking: { type: "disabled" }
   };
-  let res = await postChat(endpoint, activePayload);
-  let errorText = "";
-  if (!res.ok) {
-    errorText = await res.text();
-    if (unsupportedThinkingParam(errorText)) {
-      activePayload = {
-        model: activePayload.model,
-        temperature: activePayload.temperature,
-        messages: activePayload.messages
-      };
-      res = await postChat(endpoint, activePayload);
-      errorText = res.ok ? "" : await res.text();
-    }
-  }
-  if (!res.ok) throw new Error(`LM Studio 请求失败：${res.status} ${errorText}`);
+  const res = await postChat(settings, payload);
+  if (!res.ok) throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
   const data = await res.json();
   const content = stripThinking(extractContent(data)).trim();
   if (!content) throw new Error("AI 没有返回追问解答");
@@ -798,18 +848,8 @@ async function chatText(settings: Settings, messages: ChatMessage[]): Promise<st
 }
 
 export async function testConnection(settings: Settings) {
-  const res = await fetch(`${settings.baseUrl.replace(/\/$/, "")}/v1/models`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`无法连接 LM Studio：${res.status}`);
-  const models = await res.json();
-  const modelList = Array.isArray(models?.data) ? models.data : [];
+  ensureChatSettings(settings);
   const tests: ConnectionTestItem[] = [];
-  const modelFound = settings.model
-    ? modelList.some((model: unknown) => {
-      if (!model || typeof model !== "object") return false;
-      const item = model as Record<string, unknown>;
-      return item.id === settings.model || item.model === settings.model || item.name === settings.model;
-    })
-    : null;
 
   async function runTest(key: string, label: string, test: () => Promise<string>) {
     try {
@@ -820,117 +860,68 @@ export async function testConnection(settings: Settings) {
     }
   }
 
-  tests.push({
-    key: "models",
-    label: "模型列表",
-    ok: Array.isArray(models?.data),
-    detail: Array.isArray(models?.data) ? `返回 ${models.data.length} 个模型` : "返回体缺少 data 数组"
+  await runTest("structured_json", "JSON 模式结构化输出", async () => {
+    const result = await chat<{ ok: boolean }>(settings, [
+      { role: "system", content: "你用于测试 GLM-4.7-Flash 结构化输出连接。请严格返回 JSON。" },
+      { role: "user", content: "返回连接状态 ok 为 true。" }
+    ], "connection_test", connectionSchema);
+    if (result.ok !== true) throw new Error("ok 字段不是 true");
+    return "response_format=json_object 的 JSON 解析成功";
   });
-  if (settings.model) {
-    tests.push({
-      key: "model",
-      label: "当前模型",
-      ok: modelList.length ? Boolean(modelFound) : true,
-      detail: modelList.length
-        ? modelFound ? `已找到 ${settings.model}` : `模型列表中未找到 ${settings.model}，请确认 LM Studio 当前加载模型名`
-        : "LM Studio 未返回可校验的模型列表，继续执行实际调用测试"
-    });
-  }
-  if (settings.model) {
-    await runTest("structured_no_thinking", "结构化输出 /no_think", async () => {
-      const result = await chat<{ ok: boolean }>(settings, [
-        { role: "system", content: "你用于测试 LM Studio 结构化输出连接。请严格按 schema 返回 JSON。" },
-        { role: "user", content: "返回连接状态 ok 为 true。" }
-      ], "connection_test", connectionSchema);
-      if (result.ok !== true) throw new Error("ok 字段不是 true");
-      return "content 或 reasoning_content 中的 JSON 解析成功";
-    });
 
-    await runTest("structured_thinking", "结构化输出 thinking", async () => {
-      const result = await chat<AssessmentNarrative>(settings, [
-        { role: "system", content: "你是一位英语写作测评老师。请按 schema 返回中文 JSON。" },
-        { role: "user", content: "生成一个极短测评摘要：指出时态需要练习，并给 1 条薄弱点和 1 条建议。" }
-      ], "assessment_narrative", assessmentNarrativeSchema, { thinking: true });
-      validateAssessmentNarrative(result);
-      return "enable_thinking 请求与结构化字段校验通过";
-    });
+  await runTest("structured_thinking", "thinking 结构化输出", async () => {
+    const result = await chat<AssessmentNarrative>(settings, [
+      { role: "system", content: "你是一位英语写作测评老师。请按要求返回中文 JSON。" },
+      { role: "user", content: "生成一个极短测评摘要：指出时态需要练习，并给 1 条薄弱点和 1 条建议。" }
+    ], "assessment_narrative", assessmentNarrativeSchema, { thinking: true });
+    validateAssessmentNarrative(result);
+    return "thinking 请求与结构化字段校验通过";
+  });
 
-    await runTest("plain_text", "普通文本追问", async () => {
-      const text = await chatText(settings, [
-        { role: "system", content: "你是英语写作教练。回答必须简短。" },
-        { role: "user", content: "用中文回答：连接测试正常。" }
-      ]);
-      if (!text.trim()) throw new Error("普通文本返回为空");
-      return `无 response_format 的文本回复可读取，返回 ${text.trim().length} 个字符`;
-    });
+  await runTest("plain_text", "普通文本追问", async () => {
+    const text = await chatText(settings, [
+      { role: "system", content: "你是英语写作教练。回答必须简短。" },
+      { role: "user", content: "用中文回答：连接测试正常。" }
+    ]);
+    if (!text.trim()) throw new Error("普通文本返回为空");
+    return `无 response_format 的文本回复可读取，返回 ${text.trim().length} 个字符`;
+  });
 
-    await runTest("streaming", "流式结构化输出", async () => {
-      const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
-      const messages = assessmentNarrativeMessages({
-        totalQuestions: 1,
-        matrix: DIMENSIONS.map((dimension, index) => ({
-          dimension,
-          score: index === 0 ? 55 : 80,
-          confidence: index === 0 ? 0.4 : 0.8,
-          evidence_count: 1
-        })),
-        findings: ["第 1 题 时态 - 过去式不稳定"]
-      });
-      let activePayload: ChatPayload = {
-        model: settings.model,
-        temperature: settings.temperature,
-        response_format: schemaResponseFormat("assessment_narrative", assessmentNarrativeSchema),
-        messages,
-        enable_thinking: true,
-        stream: true,
-        stream_options: { include_usage: true }
-      };
-      let response = await postChat(endpoint, activePayload);
-      let detail = "stream_options 可用";
-      if (!response.ok) {
-        const errorText = await response.text();
-        if (unsupportedStreamOptions(errorText)) {
-          activePayload = {
-            model: settings.model,
-            temperature: settings.temperature,
-            response_format: activePayload.response_format,
-            messages,
-            enable_thinking: true,
-            stream: true
-          };
-          response = await postChat(endpoint, activePayload);
-          detail = "stream_options 不支持，已验证无 stream_options 流式请求";
-        } else if (unsupportedThinkingParam(errorText)) {
-          activePayload = {
-            model: settings.model,
-            temperature: settings.temperature,
-            response_format: activePayload.response_format,
-            messages,
-            stream: true
-          };
-          response = await postChat(endpoint, activePayload);
-          detail = "enable_thinking 不支持，已验证普通流式请求";
-        } else {
-          throw new Error(`流式请求失败：${response.status} ${errorText}`);
-        }
-      }
-      if (!response.ok) throw new Error(`流式请求失败：${response.status} ${await response.text()}`);
-      const streamed = await readChatStream(response);
-      const content = streamed.content.trim() ? streamed.content : streamed.reasoning;
-      const parsed = parseJson<AssessmentNarrative>(content);
-      validateAssessmentNarrative(parsed);
-      return `${detail}，JSON 流解析成功`;
+  await runTest("streaming", "流式结构化输出", async () => {
+    const messages = withJsonSchemaInstruction(assessmentNarrativeMessages({
+      totalQuestions: 1,
+      matrix: DIMENSIONS.map((dimension, index) => ({
+        dimension,
+        score: index === 0 ? 55 : 80,
+        confidence: index === 0 ? 0.4 : 0.8,
+        evidence_count: 1
+      })),
+      findings: ["第 1 题 时态 - 过去式不稳定"]
+    }), "assessment_narrative", assessmentNarrativeSchema);
+    const response = await postChat(settings, {
+      model: settings.model,
+      temperature: settings.temperature,
+      response_format: jsonResponseFormat(),
+      messages,
+      thinking: { type: "enabled" },
+      stream: true
     });
-  }
+    if (!response.ok) throw new Error(`流式请求失败：${response.status} ${await response.text()}`);
+    const streamed = await readChatStream(response);
+    const content = streamed.content.trim() ? streamed.content : streamed.reasoning;
+    const parsed = parseJson<AssessmentNarrative>(content);
+    validateAssessmentNarrative(parsed);
+    return "JSON 流解析成功";
+  });
 
   if (tests.some((item) => !item.ok)) {
     const failed = tests.filter((item) => !item.ok).map((item) => `${item.label}：${item.detail}`).join("；");
-    throw Object.assign(new Error(`LM Studio 连接测试未全部通过：${failed}`), {
-      connectionTestResult: { models: modelList, modelFound, tests } satisfies ConnectionTestResult
+    throw Object.assign(new Error(`GLM 连接测试未全部通过：${failed}`), {
+      connectionTestResult: { tests } satisfies ConnectionTestResult
     });
   }
 
-  return { models: modelList, modelFound, tests };
+  return { tests };
 }
 
 export async function generateQuestion(
@@ -1271,7 +1262,7 @@ ${JSON.stringify(safeOutlines)}
     ], "study_guide", studyGuideSchema, { thinking: true });
     return normalizeStudyGuide(parsed, safeOutlines);
   } catch (error) {
-    console.error("LM Studio study guide failed, using fallback", error);
+    console.error("GLM study guide failed, using fallback", error);
     return fallbackStudyGuide(safeOutlines);
   }
 }
@@ -1290,7 +1281,7 @@ export async function generateAssessmentNarrative(
     );
     return normalizeAssessmentNarrative(parsed, payload);
   } catch (error) {
-    console.error("LM Studio assessment narrative failed, using fallback", error);
+    console.error("GLM assessment narrative failed, using fallback", error);
     return fallbackAssessmentNarrative(payload);
   }
 }
@@ -1300,56 +1291,68 @@ export async function generateAssessmentNarrativeStream(
   payload: AssessmentNarrativePayload,
   onProgress?: (progress: AssessmentNarrativeStreamProgress) => void
 ): Promise<AssessmentNarrative> {
-  if (!settings.model) throw new Error("请先在设置页填写 LM Studio 模型名称");
-  const endpoint = `${settings.baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
-  const messages = assessmentNarrativeMessages(payload);
-  const basePayload: ChatPayload = {
+  ensureChatSettings(settings);
+  const messages = withJsonSchemaInstruction(assessmentNarrativeMessages(payload), "assessment_narrative", assessmentNarrativeSchema);
+  const startedAt = Date.now();
+  let lastLogAt = startedAt;
+  let pendingStreamLog = "";
+  const logPrefix = "GLM assessment narrative stream";
+  console.info(`${logPrefix} started`, {
+    model: settings.model,
+    totalQuestions: payload.totalQuestions,
+    findings: payload.findings.length,
+    prompt: formatChatMessagesForLog(messages)
+  });
+  const res = await postChat(settings, {
     model: settings.model,
     temperature: settings.temperature,
-    response_format: schemaResponseFormat("assessment_narrative", assessmentNarrativeSchema),
+    response_format: jsonResponseFormat(),
     messages,
-    enable_thinking: true,
-    stream: true,
-    stream_options: { include_usage: true }
-  };
-  let activePayload = basePayload;
-  let res = await postChat(endpoint, activePayload);
-  let errorText = "";
+    thinking: { type: "enabled" },
+    stream: true
+  });
+  console.info(`${logPrefix} response received`, {
+    status: res.status,
+    ok: res.ok,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
   if (!res.ok) {
-    errorText = await res.text();
-    if (unsupportedStreamOptions(errorText)) {
-      activePayload = {
-        model: settings.model,
-        temperature: settings.temperature,
-        response_format: basePayload.response_format,
-        messages,
-        enable_thinking: true,
-        stream: true
-      };
-      res = await postChat(endpoint, activePayload);
-      errorText = res.ok ? "" : await res.text();
-    }
-    if (!res.ok && unsupportedThinkingParam(errorText)) {
-      activePayload = {
-        model: settings.model,
-        temperature: settings.temperature,
-        response_format: basePayload.response_format,
-        messages,
-        stream: true
-      };
-      res = await postChat(endpoint, activePayload);
-      errorText = res.ok ? "" : await res.text();
-    }
-  }
-  if (!res.ok) {
-    console.error("LM Studio streaming narrative failed, using non-stream fallback", { status: res.status, errorText });
+    const errorText = await res.text();
+    console.error("GLM streaming narrative failed, using non-stream fallback", {
+      status: res.status,
+      elapsedMs: elapsedMsSince(startedAt),
+      errorText
+    });
     onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
     return generateAssessmentNarrative(settings, payload);
   }
 
   try {
-    const { content, reasoning, finalTokens } = await readChatStream(res, onProgress);
+    const { content, reasoning, finalTokens } = await readChatStream(res, (progress) => {
+      onProgress?.(progress);
+      pendingStreamLog += `${progress.deltaContent || ""}${progress.deltaReasoning || ""}`;
+      const now = Date.now();
+      if (!pendingStreamLog || (!progress.finalTokens && now - lastLogAt < 5000 && pendingStreamLog.length < 1000)) return;
+      lastLogAt = now;
+      console.info(`${logPrefix} body chunk`, {
+        generatedChars: progress.generatedChars,
+        estimatedTokens: progress.estimatedTokens,
+        tokensPerSecond: progress.tokensPerSecond,
+        finalTokens: progress.finalTokens,
+        elapsedMs: elapsedMsSince(startedAt),
+        text: pendingStreamLog
+      });
+      pendingStreamLog = "";
+    });
     const narrativeContent = content.trim() ? content : reasoning;
+    console.info(`${logPrefix} completed`, {
+      contentChars: content.length,
+      reasoningChars: reasoning.length,
+      finalTokens,
+      elapsedMs: elapsedMsSince(startedAt),
+      content,
+      reasoning
+    });
     if (finalTokens !== undefined) {
       onProgress?.({
         generatedChars: (content + reasoning).length,
@@ -1359,19 +1362,27 @@ export async function generateAssessmentNarrativeStream(
       });
     }
     if (!narrativeContent.trim()) {
-      console.warn("LM Studio streaming narrative returned only reasoning_content; retrying non-stream thinking request");
+      console.warn("GLM streaming narrative returned empty content; retrying non-stream thinking request", {
+        elapsedMs: elapsedMsSince(startedAt)
+      });
       onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
       return generateAssessmentNarrative(settings, payload);
     }
     try {
       return normalizeAssessmentNarrative(parseJson<{ summary?: string; weak_points?: string[]; recommendations?: string[] }>(narrativeContent), payload);
     } catch (parseError) {
-      console.error("LM Studio streaming narrative parse failed, using non-stream fallback", parseError);
+      console.error("GLM streaming narrative parse failed, using non-stream fallback", {
+        elapsedMs: elapsedMsSince(startedAt),
+        error: parseError
+      });
       onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
       return generateAssessmentNarrative(settings, payload);
     }
   } catch (error) {
-    console.error("LM Studio streaming narrative failed, using non-stream fallback", error);
+    console.error("GLM streaming narrative failed, using non-stream fallback", {
+      elapsedMs: elapsedMsSince(startedAt),
+      error
+    });
     onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
     return generateAssessmentNarrative(settings, payload);
   }

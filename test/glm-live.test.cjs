@@ -27,6 +27,10 @@ function primaryScore(result, dimension) {
   return result.dimension_scores?.find((item) => item.dimension === dimension)?.score;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function gradeCefrLikeAnswer(answer) {
   const result = await gradeAnswer(liveSettings(), question({
     chinese: "虽然他从去年开始一直在这家公司工作，但他仍然觉得自己有很多东西要学。",
@@ -48,26 +52,24 @@ async function gradeCefrLikeAnswer(answer) {
   };
 }
 
-const liveSkip = process.env.LIVE_LM_STUDIO === "1"
+const liveSkip = process.env.LIVE_GLM === "1"
   ? false
-  : "Set LIVE_LM_STUDIO=1 to run live LM Studio grading checks.";
+  : "Set LIVE_GLM=1 to run live GLM grading checks.";
 
-test("live LM Studio grading accepts a clearly correct answer", { skip: liveSkip }, async () => {
+test("live GLM grading handles core grading scenarios", { skip: liveSkip }, async () => {
   const result = await gradeAnswer(liveSettings(), question({}), "I finished my homework yesterday.");
 
   assert.equal(result.verdict, "correct");
   assert.ok((primaryScore(result, "时态") ?? 0) >= 80);
-});
+  await delay(12000);
 
-test("live LM Studio grading rejects a clear tense error", { skip: liveSkip }, async () => {
-  const result = await gradeAnswer(liveSettings(), question({}), "I finish my homework yesterday.");
+  const tenseResult = await gradeAnswer(liveSettings(), question({}), "I finish my homework yesterday.");
 
-  assert.notEqual(result.verdict, "correct");
-  assert.ok((primaryScore(result, "时态") ?? 100) < 80);
-});
+  assert.notEqual(tenseResult.verdict, "correct");
+  assert.ok((primaryScore(tenseResult, "时态") ?? 100) < 80);
+  await delay(12000);
 
-test("live LM Studio grading penalizes missing required passive voice", { skip: liveSkip }, async () => {
-  const result = await gradeAnswer(liveSettings(), question({
+  const passiveResult = await gradeAnswer(liveSettings(), question({
     chinese: "这封信昨天被寄出了。",
     answers: ["The letter was sent yesterday."],
     grammar_focus: "一般过去时被动语态",
@@ -76,11 +78,15 @@ test("live LM Studio grading penalizes missing required passive voice", { skip: 
     rubric_points: ["必须使用 was/were + past participle 表达被动。"]
   }), "Someone sent the letter yesterday.");
 
-  assert.notEqual(result.verdict, "correct");
-  assert.ok((primaryScore(result, "被动语态") ?? 100) < 80);
+  assert.notEqual(passiveResult.verdict, "correct");
+  assert.ok((primaryScore(passiveResult, "被动语态") ?? 100) < 80);
 });
 
-test("live LM Studio grading roughly orders CEFR-like answers by quality", { skip: liveSkip }, async () => {
+const extendedSkip = process.env.LIVE_GLM_EXTENDED === "1"
+  ? liveSkip
+  : "Set LIVE_GLM_EXTENDED=1 to run the slower multi-request live ordering check.";
+
+test("live GLM grading roughly orders CEFR-like answers by quality", { skip: extendedSkip }, async () => {
   const cases = [
     ["A1", "He work company last year. He have many learn."],
     ["A2", "He works in this company from last year, but he still feel he has many things learn."],

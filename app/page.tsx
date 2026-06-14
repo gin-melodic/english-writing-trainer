@@ -66,8 +66,6 @@ type ConnectionTestItem = {
   detail: string;
 };
 type ConnectionTestResult = {
-  models: unknown[];
-  modelFound: boolean | null;
   tests: ConnectionTestItem[];
 };
 type ConnectionTestResponse = ConnectionTestResult & {
@@ -75,6 +73,7 @@ type ConnectionTestResponse = ConnectionTestResult & {
   message?: string;
   result?: ConnectionTestResult;
 };
+type SettingsTestTarget = "global" | "personal";
 type CaptureResponse = {
   id?: number;
   card: DrillCard;
@@ -86,6 +85,18 @@ type CaptureState = {
   loading: string;
   error: string;
   saved: boolean;
+};
+type LlmQueueSnapshot = {
+  state: "idle" | "processing" | "queued";
+  pendingCount: number;
+  runningCount: number;
+  myPosition: number | null;
+  completedCount: number;
+  failedCount: number;
+};
+type SettingsDraft = Settings & {
+  personalApiKey?: string;
+  clearPersonalApiKey?: boolean;
 };
 type CurrentUser = {
   id: number;
@@ -122,7 +133,17 @@ type AppState = {
 
 const emptyState: AppState = {
   user: null,
-  settings: { baseUrl: "http://localhost:1234", model: "", temperature: 0.3, dailyCount: 20, maxConcurrentPredictions: 5 },
+  settings: {
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    model: "glm-4.7-flash",
+    temperature: 0.3,
+    dailyCount: 20,
+    maxConcurrentPredictions: 1,
+    personalProviderEnabled: false,
+    personalBaseUrl: "https://api.siliconflow.cn/v1",
+    personalModel: "deepseek-ai/DeepSeek-V4-Flash",
+    hasPersonalApiKey: false
+  },
   abilities: DIMENSIONS.map((dimension) => ({ dimension, score: 50, evidence_count: 0 })),
   skillAbilities: [],
   history: [],
@@ -548,10 +569,18 @@ export default function Home() {
   const [progress, setProgress] = useState({ current: 0, total: 20 });
   const [beforeScores, setBeforeScores] = useState<Ability[]>(emptyState.abilities);
   const [showDelta, setShowDelta] = useState(false);
-  const [settingsDraft, setSettingsDraft] = useState<Settings>(emptyState.settings);
+  const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(emptyState.settings);
+  const [llmStatus, setLlmStatus] = useState<LlmQueueSnapshot>({
+    state: "idle",
+    pendingCount: 0,
+    runningCount: 0,
+    myPosition: null,
+    completedCount: 0,
+    failedCount: 0
+  });
   const [assessmentOptions, setAssessmentOptions] = useState<AssessmentOptions>(DEFAULT_ASSESSMENT_OPTIONS);
   const [assessmentExtension, setAssessmentExtension] = useState<AssessmentExtensionState>({ phase: "idle" });
-  const [assessmentProgress, setAssessmentProgress] = useState<AssessmentProgress>();
+  const [, setAssessmentProgress] = useState<AssessmentProgress>();
   const [assessmentReportPage, setAssessmentReportPage] = useState(1);
   const [assessmentReportPageSize] = useState(10);
   const [trendDimension, setTrendDimension] = useState<Dimension>("时态");
@@ -583,6 +612,41 @@ export default function Home() {
   useEffect(() => {
     refresh().catch((err) => setError(err.message));
   }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    const readStatus = async () => {
+      try {
+        const next = await api<LlmQueueSnapshot>("/api/llm/status");
+        if (!cancelled) setLlmStatus(next);
+      } catch {
+        // Auth redirects and transient status failures are handled elsewhere.
+      }
+    };
+    if (typeof EventSource === "undefined") {
+      void readStatus();
+      interval = setInterval(readStatus, 5000);
+      return () => {
+        cancelled = true;
+        if (interval) clearInterval(interval);
+      };
+    }
+    const source = new EventSource("/api/llm/events");
+    source.addEventListener("status", (event) => {
+      setLlmStatus(JSON.parse((event as MessageEvent).data) as LlmQueueSnapshot);
+    });
+    source.onerror = () => {
+      source.close();
+      void readStatus();
+      interval = setInterval(readStatus, 5000);
+    };
+    return () => {
+      cancelled = true;
+      source.close();
+      if (interval) clearInterval(interval);
+    };
+  }, []);
 
   async function logout() {
     await fetch("/api/auth/logout", { method: "POST" });
@@ -671,8 +735,8 @@ export default function Home() {
     if (aiTotal < 1) return questions;
     const from = questions.length + 1;
     const to = nextTotal;
-    setLoading(`AI 正在一次性生成题目 ${from}-${to}/${nextTotal}…`);
-    setPaperGenerationProgress(nextMode, questions.length, nextTotal, `AI 正在一次性规划并生成第 ${from}-${to} 题，避免题目重复。`);
+    setLoading(`AI 正在生成题目 ${from}-${to}/${nextTotal}…`);
+    setPaperGenerationProgress(nextMode, questions.length, nextTotal, `AI 正在规划并生成第 ${from}-${to} 题。`);
     const previousQuestions = questions.map((question) => question.chinese);
     const specs = Array.from({ length: aiTotal }, (_, offset) => {
       const index = questions.length + offset;
@@ -742,7 +806,7 @@ export default function Home() {
       await completeAssessmentProgress("试卷生成完成", `已准备好 ${questions.length} 道题，可以预览后开始答题。`);
     } catch (err) {
       setSessionStarted(false);
-      setError(errorMessage(err, "试卷生成失败，请检查 LM Studio 设置后重试。"));
+      setError(errorMessage(err, "试卷生成失败，请检查 GLM 设置后重试。"));
       setAssessmentProgress(undefined);
     } finally {
       setLoading("");
@@ -902,7 +966,7 @@ export default function Home() {
       }
       completed = true;
     } catch (err) {
-      setError(errorMessage(err, "批改失败，请检查 LM Studio 设置。"));
+      setError(errorMessage(err, "批改失败，请检查 GLM 设置。"));
     } finally {
       setLoading("");
       if (isAssessmentSubmit) {
@@ -920,7 +984,7 @@ export default function Home() {
     setError("");
     const extensionQuestions: Question[] = [];
     try {
-      setLoading(`AI 正在一次性生成扩展题 1-${plan.length}/${plan.length}…`);
+      setLoading(`AI 正在生成扩展题 1-${plan.length}/${plan.length}…`);
       const previousQuestions = questionQueue.map((item) => item.chinese);
       const data = await api<QuestionResponse>("/api/question", {
         method: "POST",
@@ -945,7 +1009,7 @@ export default function Home() {
       setAssessmentExtension({ phase: "preview", plan, questions: extensionQuestions, notes: {} });
       setSessionStarted(false);
     } catch (err) {
-      setError(errorMessage(err, "扩展题生成失败，请检查 LM Studio 设置。"));
+      setError(errorMessage(err, "扩展题生成失败，请检查 GLM 设置。"));
     } finally {
       setLoading("");
     }
@@ -1186,6 +1250,7 @@ export default function Home() {
             </button>
           ))}
         </div>
+        <SystemStatus status={llmStatus} settings={state.settings} onOpenSettings={() => { setAssessment(false); setView("设置"); }} />
       </aside>
 
       <main className="main">
@@ -1375,8 +1440,32 @@ export default function Home() {
             onSave={saveCaptureCard}
           />
         )}
-        {assessmentProgress && <AssessmentProgressModal progress={assessmentProgress} />}
       </main>
+    </div>
+  );
+}
+
+function SystemStatus({ status, settings, onOpenSettings }: {
+  status: LlmQueueSnapshot;
+  settings: Settings;
+  onOpenSettings: () => void;
+}) {
+  const personalReady = settings.hasPersonalApiKey;
+  const statusText = personalReady
+    ? "个人模型已启用"
+    : status.runningCount > 0
+      ? "处理中"
+      : status.pendingCount > 0 ? "排队中" : "空闲";
+  return (
+    <div className="system-status">
+      <strong>系统运行状态</strong>
+      <div className="status-pill">{statusText}</div>
+      <p>平台队列：{status.runningCount ? "处理中" : "空闲"} · 排队 {status.pendingCount}</p>
+      <p>我的排位：{status.myPosition === 0 ? "正在处理" : status.myPosition ? `第 ${status.myPosition} 位` : "无排队任务"}</p>
+      <p>独享模型：{personalReady ? "已启用" : "未启用"}</p>
+      {!personalReady && status.pendingCount > 0 && (
+        <button type="button" onClick={onOpenSettings}>配置 SiliconFlow 免平台排队</button>
+      )}
     </div>
   );
 }
@@ -1451,45 +1540,6 @@ function QuickCaptureModal({ capture, setCapture, onGenerate, onSave }: {
   );
 }
 
-function AssessmentProgressModal({ progress }: { progress: AssessmentProgress }) {
-  const complete = progress.status === "complete";
-  return (
-    <div className="assessment-loading-backdrop" role="presentation">
-      <section className={`assessment-loading-modal${complete ? " complete" : ""}`} role="dialog" aria-modal="true" aria-labelledby="assessment-loading-title">
-        {complete ? (
-          <div className="assessment-complete-mark" aria-hidden="true">
-            <CheckCircle2 size={48} strokeWidth={2.4} />
-          </div>
-        ) : (
-          <div className="assessment-loader" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </div>
-        )}
-        <div className="assessment-loading-copy">
-          <h2 id="assessment-loading-title">{progress.title}</h2>
-          <p>{progress.detail}</p>
-        </div>
-        <div className="assessment-progress-meta">
-          <span>{progress.meta}</span>
-          <strong>{progress.percent}%</strong>
-        </div>
-        <div className="assessment-progress-bar" aria-label={`加载进度 ${progress.percent}%`}>
-          <span style={{ width: `${progress.percent}%` }} />
-        </div>
-        {(progress.estimatedTokens !== undefined || progress.generatedChars !== undefined || progress.tokensPerSecond !== undefined) && (
-          <div className="assessment-token-stats" aria-label="LLM 生成统计">
-            {progress.estimatedTokens !== undefined && <span>约 {progress.finalTokens ?? progress.estimatedTokens} tokens</span>}
-            {progress.tokensPerSecond !== undefined && progress.tokensPerSecond > 0 && <span>{progress.tokensPerSecond} tokens/s</span>}
-            {progress.generatedChars !== undefined && <span>{progress.generatedChars} 字符</span>}
-          </div>
-        )}
-      </section>
-    </div>
-  );
-}
-
 function StartPage({ mode, state, total, specialDimension, setSpecialDimension, skillAbilities, assessmentOptions, setAssessmentOptions, loading, error, onGenerate, onSkipAssessment }: {
   mode: TrainingMode;
   state: AppState;
@@ -1513,11 +1563,11 @@ function StartPage({ mode, state, total, specialDimension, setSpecialDimension, 
       ? `开始后会先生成 ${normalizedAssessmentOptions.initialCount} 道测评题；系统会根据薄弱和不确定维度最多追加到 ${normalizedAssessmentOptions.maxCount} 题，结束后统一生成能力报告。`
       : `开始后只生成 ${normalizedAssessmentOptions.initialCount} 道测评题，不自动追加题目，结束后统一生成能力报告。`
     : mode === "每日练习"
-      ? `开始后会一次性生成 ${total} 道题，优先加入 ${state.activeCapturedDrillCount} 张快速捕捉卡，再根据当前能力选择薄弱维度。`
+      ? `开始后会生成 ${total} 道题，优先加入 ${state.activeCapturedDrillCount} 张快速捕捉卡，再根据当前能力选择薄弱维度。`
       : mode === "专项训练"
-        ? `开始后会一次性生成 ${total} 道 ${specialDimension} 题，集中训练单一语法维度。`
+        ? `开始后会生成 ${total} 道 ${specialDimension} 题，集中训练单一语法维度。`
         : activeMistakes > 0
-          ? `开始后会一次性生成 ${total} 道错题重练，答对两次的错题会从重练列表移除。`
+          ? `开始后会生成 ${total} 道错题重练，答对两次的错题会从重练列表移除。`
           : "当前没有需要重练的错题。";
 
   return (
@@ -1819,7 +1869,7 @@ function AssessmentExtensionDecision({ plan, loading, error, onGenerate, onSkip 
       <div className="topbar">
         <div>
           <h1 className="title">是否扩展本次测评</h1>
-          <p className="muted">系统已完成基础题组批改。下面这些维度仍缺少稳定判断依据，确认后会一次性生成 {plan.length} 道扩展题。</p>
+          <p className="muted">系统已完成基础题组批改。下面这些维度仍缺少稳定判断依据，确认后会生成 {plan.length} 道扩展题。</p>
         </div>
       </div>
       <section className="section extension-explain">
@@ -2115,35 +2165,57 @@ function PracticeReportView({ report }: { report: PracticeReport }) {
 }
 
 function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
-  draft: Settings;
-  setDraft: (value: Settings) => void;
+  draft: SettingsDraft;
+  setDraft: (value: SettingsDraft) => void;
   refresh: () => Promise<void>;
   setError: (value: string) => void;
   error: string;
   isAdmin: boolean;
 }) {
   const [message, setMessage] = useState("");
-  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [testResult, setTestResult] = useState<{ target: SettingsTestTarget; result: ConnectionTestResult } | null>(null);
+  const [showPersonalGuide, setShowPersonalGuide] = useState(false);
+  const canTestPersonalModel = Boolean(draft.hasPersonalApiKey || draft.personalApiKey?.trim());
+  const renderConnectionTestResult = (target: SettingsTestTarget) => testResult?.target === target && (
+    <div className="connection-test-list">
+      {testResult.result.tests.map((item) => (
+        <div key={item.key} className={item.ok ? "connection-test-item ok" : "connection-test-item failed"}>
+          {item.ok ? <CheckCircle2 size={17} /> : <X size={17} />}
+          <div>
+            <strong>{item.label}</strong>
+            <span>{item.detail}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
   async function save() {
-    await api("/api/settings", { method: "PUT", body: JSON.stringify(draft) });
-    setMessage("设置已保存");
     setTestResult(null);
-    await refresh();
+    const personalKeyChanged = Boolean(draft.personalApiKey?.trim());
+    setMessage(personalKeyChanged ? "正在验证个人 API Key…" : "正在保存设置…");
+    try {
+      const saved = await api<Settings>("/api/settings", { method: "PUT", body: JSON.stringify(draft) });
+      setMessage(personalKeyChanged ? "API Key 验证通过，独享模型已启用" : "设置已保存");
+      setDraft({ ...saved, personalApiKey: "", clearPersonalApiKey: false });
+      await refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "保存设置失败");
+    }
   }
-  async function test() {
-    setMessage("正在测试连接…");
+  async function test(target: SettingsTestTarget) {
+    setMessage(target === "personal" ? "正在验证独享模型…" : "正在测试免费模型…");
     setTestResult(null);
     try {
       const res = await fetch("/api/settings/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draft)
+        body: JSON.stringify({ ...draft, target })
       });
       const data = await res.json().catch(() => ({})) as ConnectionTestResponse;
       const result = res.ok ? data : data.result;
-      if (result) setTestResult(result);
+      if (result) setTestResult({ target, result });
       if (!res.ok) throw new Error(data.message || "连接失败");
-      setMessage("连接成功，所有测试项已通过");
+      setMessage(target === "personal" ? "独享模型验证成功，所有测试项已通过" : "免费模型连接成功，所有测试项已通过");
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "连接失败");
     }
@@ -2162,36 +2234,64 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
       <div className="section form-grid">
         {isAdmin && (
           <>
-            <label>LM Studio 服务地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
-            <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="填写 LM Studio 中加载的模型名" /></label>
+            <label>GLM API 地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
+            <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="glm-4.7-flash" /></label>
             <label>Temperature<input type="number" min="0" max="1" step="0.1" value={draft.temperature} onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })} /></label>
           </>
         )}
         <label>每日练习题数<input type="number" min="10" max="50" value={draft.dailyCount} onChange={(e) => setDraft({ ...draft, dailyCount: Number(e.target.value) })} /></label>
         {isAdmin && (
-          <label>应用并发生成数<input type="number" min="1" max="10" value={draft.maxConcurrentPredictions} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">建议与 LM Studio 的 Max Concurrent Predictions 保持一致。</span></label>
+          <label>应用并发生成数<input type="number" min="1" max="1" value={1} disabled onChange={() => setDraft({ ...draft, maxConcurrentPredictions: 1 })} /><span className="field-hint">GLM-4.7-Flash 免费模型并发限制为 1，应用固定按 1 处理。</span></label>
+        )}
+      </div>
+      <div className="section personal-model-section">
+        <div className="section-heading">
+          <div>
+            <h2>独享模型</h2>
+            <p className="muted">填写 SiliconFlow API Key 并验证通过后自动启用；清除 Key 后自动关闭。</p>
+          </div>
+          <div className="status-pill">{draft.hasPersonalApiKey ? "已启用" : draft.personalApiKey?.trim() ? "待验证" : "未启用"}</div>
+        </div>
+        <div className="form-grid">
+          <label>SiliconFlow API 地址<input value={draft.personalBaseUrl} onChange={(e) => setDraft({ ...draft, personalBaseUrl: e.target.value })} placeholder="https://api.siliconflow.cn/v1" /></label>
+          <label>模型名称<input value={draft.personalModel} onChange={(e) => setDraft({ ...draft, personalModel: e.target.value })} placeholder="deepseek-ai/DeepSeek-V4-Flash" /></label>
+          <label>
+            API Key
+            <input
+              type="password"
+              value={draft.personalApiKey || ""}
+              onChange={(e) => setDraft({ ...draft, personalApiKey: e.target.value, clearPersonalApiKey: false })}
+              placeholder={draft.hasPersonalApiKey ? "已保存，输入新 Key 可替换" : "粘贴 SiliconFlow API Key"}
+            />
+            <span className="field-hint">保存时会先验证，验证通过后服务器加密保存个人 Key</span>
+          </label>
+        </div>
+        <div className="actions" style={{ justifyContent: "flex-start" }}>
+          <button type="button" className="primary" onClick={() => test("personal")} disabled={!canTestPersonalModel}>验证独享模型</button>
+          <button type="button" onClick={() => setShowPersonalGuide((value) => !value)}>{showPersonalGuide ? "收起教程" : "查看 SiliconFlow 教程"}</button>
+          {draft.hasPersonalApiKey && <button type="button" onClick={() => setDraft({ ...draft, personalProviderEnabled: false, personalApiKey: "", clearPersonalApiKey: true, hasPersonalApiKey: false })}>清除个人 Key</button>}
+        </div>
+        {renderConnectionTestResult("personal")}
+        {showPersonalGuide && (
+          <div className="personal-guide">
+            <p>注册链接：<a href="https://cloud.siliconflow.cn/i/x77lxErl" target="_blank" rel="noreferrer">https://cloud.siliconflow.cn/i/x77lxErl</a></p>
+            <ol>
+              <li>注册或登录 SiliconFlow。</li>
+              <li>领取免费可用额度。</li>
+              <li>创建 API Key。</li>
+              <li>粘贴到这里并保存，验证通过后会自动启用。</li>
+            </ol>
+          </div>
         )}
       </div>
       <div className="actions" style={{ justifyContent: "flex-start" }}>
         <button className="primary" onClick={save}>保存设置</button>
-        {isAdmin && <button onClick={test}>测试连接</button>}
+        {isAdmin && <button onClick={() => test("global")}>测试免费模型</button>}
         <button onClick={() => reset("assessment")}>重置能力评估</button>
         <button className="danger" onClick={() => reset("all")}>清除所有数据</button>
       </div>
       {(message || error) && <div className="notice">{message || error}</div>}
-      {testResult && (
-        <div className="connection-test-list">
-          {testResult.tests.map((item) => (
-            <div key={item.key} className={item.ok ? "connection-test-item ok" : "connection-test-item failed"}>
-              {item.ok ? <CheckCircle2 size={17} /> : <X size={17} />}
-              <div>
-                <strong>{item.label}</strong>
-                <span>{item.detail}</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+      {renderConnectionTestResult("global")}
     </section>
   );
 }

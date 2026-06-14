@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSettings, initDb } from "@/lib/db";
+import { getRuntimeSettings, initDb } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateStudyGuide } from "@/lib/llm";
 import { DIMENSIONS, Dimension, Question } from "@/lib/types";
@@ -36,7 +36,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "缺少可用于生成学习内容的试卷知识点。" }, { status: 400 });
     }
 
-    const guide = await generateStudyGuide(getSettings(user.id), outlines);
+    const guide = await generateStudyGuide(getRuntimeSettings(user.id), outlines);
     return NextResponse.json({ guide });
   } catch (error) {
     const authResponse = authErrorResponse(error);

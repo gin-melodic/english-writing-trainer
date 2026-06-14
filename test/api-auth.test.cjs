@@ -14,6 +14,8 @@ process.env.ADMIN_USERNAME = "api_admin";
 process.env.ADMIN_PASSWORD = "api_admin_password";
 
 const { GET: getState } = require("../app/api/state/route.ts");
+const { GET: getLlmStatus } = require("../app/api/llm/status/route.ts");
+const { GET: getLlmEvents } = require("../app/api/llm/events/route.ts");
 const { POST: login } = require("../app/api/auth/login/route.ts");
 const { POST: logout } = require("../app/api/auth/logout/route.ts");
 const { GET: getAdminInvites } = require("../app/api/admin/invites/route.ts");
@@ -28,6 +30,13 @@ test("state API requires authentication", async () => {
   const response = await getState(new Request("http://localhost/api/state"));
 
   assert.equal(response.status, 401);
+});
+
+test("LLM queue status and events require authentication", async () => {
+  initDb();
+
+  assert.equal((await getLlmStatus(new Request("http://localhost/api/llm/status"))).status, 401);
+  assert.equal((await getLlmEvents(new Request("http://localhost/api/llm/events"))).status, 401);
 });
 
 test("login sets a session cookie and logout invalidates it", async () => {
@@ -56,4 +65,18 @@ test("admin routes reject normal users", async () => {
   }));
 
   assert.equal(response.status, 403);
+});
+
+test("LLM events return SSE headers for authenticated users", async () => {
+  initDb();
+  const user = createUser({ username: "api_sse_user", password: "password_123" });
+  const session = createAuthSession(user.id);
+  const response = await getLlmEvents(new Request("http://localhost/api/llm/events", {
+    headers: { cookie: `trainer_session=${encodeURIComponent(session.token)}` }
+  }));
+
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type"), /text\/event-stream/);
+  assert.match(response.headers.get("cache-control"), /no-cache/);
+  await response.body.cancel();
 });

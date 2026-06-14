@@ -6,10 +6,12 @@ const assert = require("node:assert/strict");
 const { generateAssessmentNarrativeStream, generateDrillCard, generateQuestion, generateQuestions, generateStudyGuide, gradeAnswer, testConnection } = require("../lib/llm.ts");
 const { publicQuestionSkills } = require("../lib/questionSafety.ts");
 
+process.env.ZAI_API_KEY = "test-api-key";
+
 function settings() {
   return {
-    baseUrl: "http://lmstudio.test",
-    model: "qwen3.6",
+    baseUrl: "https://open.bigmodel.test/api/paas/v4",
+    model: "glm-4.7-flash",
     temperature: 0.2,
     dailyCount: 10,
     maxConcurrentPredictions: 1
@@ -59,21 +61,14 @@ test("public question skills remove answer-revealing formulas", () => {
   ]), ["过去完成时判断"]);
 });
 
-test("connection test covers model list, structured, text, thinking, and streaming scenarios", async () => {
+test("connection test covers GLM structured, text, thinking, and streaming scenarios", async () => {
   const requests = [];
+  const headers = [];
   const originalFetch = global.fetch;
-  global.fetch = async (url, init) => {
-    if (String(url).endsWith("/v1/models")) {
-      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
+  global.fetch = async (_url, init) => {
     const request = JSON.parse(init.body);
     requests.push(request);
-    if (request.stream && request.stream_options) {
-      return new Response("unsupported stream_options", { status: 400 });
-    }
+    headers.push(init.headers);
     if (request.stream) {
       return reasoningOnlyStreamResponse(JSON.stringify({
         summary: "流式测试显示连接正常。",
@@ -89,7 +84,7 @@ test("connection test covers model list, structured, text, thinking, and streami
         headers: { "Content-Type": "application/json" }
       });
     }
-    if (request.enable_thinking) {
+    if (request.thinking?.type === "enabled") {
       return new Response(JSON.stringify({
         choices: [{
           message: {
@@ -117,22 +112,91 @@ test("connection test covers model list, structured, text, thinking, and streami
   try {
     const result = await testConnection(settings());
 
-    assert.equal(result.modelFound, true);
     assert.deepEqual(result.tests.map((item) => [item.key, item.ok]), [
-      ["models", true],
-      ["model", true],
-      ["structured_no_thinking", true],
+      ["structured_json", true],
       ["structured_thinking", true],
       ["plain_text", true],
       ["streaming", true]
     ]);
-    assert.equal(requests[0].messages[1].content.includes("/no_think"), true);
-    assert.equal(requests[1].enable_thinking, true);
+    assert.equal(headers[0].Authorization, "Bearer test-api-key");
+    assert.equal(requests[0].response_format.type, "json_object");
+    assert.match(requests[0].messages[1].content, /connection_test schema/);
+    assert.equal(requests[0].thinking.type, "disabled");
+    assert.equal(requests[1].thinking.type, "enabled");
     assert.equal(requests[2].response_format, undefined);
-    assert.equal(requests[3].stream_options.include_usage, true);
-    assert.equal(requests[4].stream, true);
-    assert.equal("stream_options" in requests[4], false);
-    assert.match(result.tests.find((item) => item.key === "streaming").detail, /无 stream_options/);
+    assert.equal(requests[3].stream, true);
+    assert.equal(requests[3].thinking.type, "enabled");
+    assert.equal("stream_options" in requests[3], false);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("personal SiliconFlow settings use personal key and omit Z.ai thinking payload", async () => {
+  const requests = [];
+  const urls = [];
+  const headers = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, init) => {
+    const request = JSON.parse(init.body);
+    urls.push(url);
+    requests.push(request);
+    headers.push(init.headers);
+    if (request.stream) {
+      return streamResponse(JSON.stringify({
+        summary: "个人模型流式测试正常。",
+        weak_points: ["时态：过去式需要继续练习。"],
+        recommendations: ["每天做 1 道过去时练习。"]
+      }));
+    }
+    if (!request.response_format) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "个人模型连接正常。" } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (request.messages.some((message) => /connection_test schema/.test(message.content))) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ ok: true }) } }]
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            summary: "个人模型测试显示连接正常。",
+            weak_points: ["时态：过去式需要继续练习。"],
+            recommendations: ["每天做 1 道过去时练习。"]
+          })
+        }
+      }]
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  };
+
+  try {
+    const result = await testConnection({
+      ...settings(),
+      personalProviderEnabled: true,
+      personalBaseUrl: "https://api.siliconflow.test/v1",
+      personalModel: "deepseek-ai/DeepSeek-V4-Flash",
+      hasPersonalApiKey: true,
+      personalApiKey: "sf-test-key"
+    });
+
+    assert.equal(result.tests.every((item) => item.ok), true);
+    assert.equal(urls.every((url) => url === "https://api.siliconflow.test/v1/chat/completions"), true);
+    assert.equal(headers.every((header) => header.Authorization === "Bearer sf-test-key"), true);
+    assert.equal(requests.every((request) => request.model === "deepseek-ai/DeepSeek-V4-Flash"), true);
+    assert.equal(requests.every((request) => !("thinking" in request)), true);
+    assert.equal(requests.some((request) => request.response_format?.type === "json_object"), true);
   } finally {
     global.fetch = originalFetch;
   }
@@ -140,13 +204,7 @@ test("connection test covers model list, structured, text, thinking, and streami
 
 test("connection test exposes failed response validation details", async () => {
   const originalFetch = global.fetch;
-  global.fetch = async (url, init) => {
-    if (String(url).endsWith("/v1/models")) {
-      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
+  global.fetch = async (_url, init) => {
     const request = JSON.parse(init.body);
     if (!request.response_format) {
       return new Response(JSON.stringify({
@@ -171,7 +229,7 @@ test("connection test exposes failed response validation details", async () => {
         assert.match(error.message, /未全部通过/);
         const result = error.connectionTestResult;
         assert.equal(result.tests.find((item) => item.key === "plain_text").ok, false);
-        assert.equal(result.tests.find((item) => item.key === "structured_no_thinking").ok, true);
+        assert.equal(result.tests.find((item) => item.key === "structured_json").ok, true);
         return true;
       }
     );
@@ -182,13 +240,7 @@ test("connection test exposes failed response validation details", async () => {
 
 test("connection test accepts very short plain text responses", async () => {
   const originalFetch = global.fetch;
-  global.fetch = async (url, init) => {
-    if (String(url).endsWith("/v1/models")) {
-      return new Response(JSON.stringify({ data: [{ id: "qwen3.6" }] }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
+  global.fetch = async (_url, init) => {
     const request = JSON.parse(init.body);
     if (request.stream) {
       return reasoningOnlyStreamResponse(JSON.stringify({
@@ -205,7 +257,7 @@ test("connection test accepts very short plain text responses", async () => {
         headers: { "Content-Type": "application/json" }
       });
     }
-    if (request.enable_thinking) {
+    if (request.thinking?.type === "enabled") {
       return new Response(JSON.stringify({
         choices: [{
           message: {
@@ -239,14 +291,11 @@ test("connection test accepts very short plain text responses", async () => {
   }
 });
 
-test("assessment narrative stream keeps enable_thinking when retrying without stream_options", async () => {
+test("assessment narrative stream sends GLM thinking and json mode", async () => {
   const requests = [];
   const originalFetch = global.fetch;
   global.fetch = async (_url, init) => {
     requests.push(JSON.parse(init.body));
-    if (requests.length === 1) {
-      return new Response("unsupported stream_options", { status: 400 });
-    }
     return streamResponse(JSON.stringify({
       summary: "本次测评显示时态需要优先巩固。",
       weak_points: ["时态：过去式使用不稳定，需要先复盘基础形式。"],
@@ -257,11 +306,12 @@ test("assessment narrative stream keeps enable_thinking when retrying without st
   try {
     const result = await generateAssessmentNarrativeStream(settings(), payload());
 
-    assert.equal(requests.length, 2);
-    assert.equal(requests[0].enable_thinking, true);
-    assert.deepEqual(requests[0].stream_options, { include_usage: true });
-    assert.equal(requests[1].enable_thinking, true);
-    assert.equal("stream_options" in requests[1], false);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].thinking.type, "enabled");
+    assert.deepEqual(requests[0].response_format, { type: "json_object" });
+    assert.equal(requests[0].stream, true);
+    assert.equal("stream_options" in requests[0], false);
+    assert.match(requests[0].messages[1].content, /assessment_narrative schema/);
     assert.equal(result.summary, "本次测评显示时态需要优先巩固。");
   } finally {
     global.fetch = originalFetch;
@@ -286,7 +336,7 @@ test("assessment narrative stream parses structured JSON from reasoning_content"
 
     assert.equal(requests.length, 1);
     assert.equal(requests[0].stream, true);
-    assert.equal(requests[0].enable_thinking, true);
+    assert.equal(requests[0].thinking.type, "enabled");
     assert.equal(result.summary, "流式 reasoning_content 报告成功生成。");
   } finally {
     global.fetch = originalFetch;
@@ -321,9 +371,9 @@ test("assessment narrative stream retries non-stream when reasoning_content is n
 
     assert.equal(requests.length, 2);
     assert.equal(requests[0].stream, true);
-    assert.equal(requests[0].enable_thinking, true);
+    assert.equal(requests[0].thinking.type, "enabled");
     assert.equal("stream" in requests[1], false);
-    assert.equal(requests[1].enable_thinking, true);
+    assert.equal(requests[1].thinking.type, "enabled");
     assert.equal(result.summary, "非流式报告成功生成。");
   } finally {
     global.fetch = originalFetch;
@@ -368,7 +418,7 @@ test("question generation can opt into thinking mode", async () => {
     );
 
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].enable_thinking, true);
+    assert.equal(requests[0].thinking.type, "enabled");
     assert.equal(requests[0].messages[1].content.includes("/no_think"), false);
     assert.equal(requests[0].messages[1].content.includes("高信息密度"), false);
     assert.equal(requests[0].messages[1].content.includes("1-2 个可独立评分的次要维度"), true);
@@ -414,8 +464,9 @@ test("drill card generation sends structured schema and normalizes reference ans
     const card = await generateDrillCard(settings(), "我今天上午一直在开会，所以报告可能晚点交。");
 
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].response_format.json_schema.name, "drill_card");
-    assert.equal(requests[0].messages[1].content.includes("/no_think"), true);
+    assert.deepEqual(requests[0].response_format, { type: "json_object" });
+    assert.match(requests[0].messages[1].content, /drill_card schema/);
+    assert.equal(requests[0].thinking.type, "disabled");
     assert.match(requests[0].messages[1].content, /grammar_dimension 只能从以下 6 个值中选 1 个/);
     assert.equal(card.reference_en, card.standard);
     assert.equal(card.grammar_dimension, "连接词");
@@ -543,7 +594,8 @@ test("batch question generation requests all questions in one structured call", 
     ], true, ["我昨天去了商店。"]);
 
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].response_format.json_schema.name, "assessment_question_batch");
+    assert.deepEqual(requests[0].response_format, { type: "json_object" });
+    assert.match(requests[0].messages[1].content, /assessment_question_batch schema/);
     assert.match(requests[0].messages[1].content, /一次性生成 2 道/);
     assert.match(requests[0].messages[1].content, /场景尽量分散/);
     assert.match(requests[0].messages[1].content, /像日常微信、课堂、办公室、家里/);
@@ -607,7 +659,7 @@ test("study guide generation uses outlines without original questions or answers
     const prompt = requests[0].messages.map((message) => message.content).join("\n");
     assert.equal(prompt.includes("昨天我完成了作业"), false);
     assert.equal(prompt.includes("I finished my homework yesterday"), false);
-    assert.equal(requests[0].enable_thinking, true);
+    assert.equal(requests[0].thinking.type, "enabled");
     assert.equal(guide.sections[0].title, "一般过去时");
     assert.equal(guide.sections[0].drills[0].answer, "She cleaned the room yesterday.");
   } finally {

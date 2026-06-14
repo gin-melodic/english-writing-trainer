@@ -119,6 +119,39 @@ button:disabled {
   border-color: var(--accent);
 }
 
+.system-status {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.system-status strong {
+  color: var(--text);
+}
+
+.system-status p {
+  margin: 0;
+}
+
+.system-status button {
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.status-pill {
+  width: fit-content;
+  border: 1px solid rgba(98, 212, 139, 0.35);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(98, 212, 139, 0.09);
+  color: var(--green);
+}
+
 .user-strip {
   display: flex;
   align-items: center;
@@ -1272,170 +1305,53 @@ button.skill-pill {
   line-height: 1.45;
 }
 
-.assessment-loading-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
+.personal-model-section {
   display: grid;
-  place-items: center;
-  padding: 20px;
-  background: rgba(5, 7, 9, 0.72);
-  backdrop-filter: blur(8px);
+  gap: 16px;
 }
 
-.assessment-loading-modal {
-  width: min(460px, 100%);
-  border: 1px solid #44505c;
-  border-radius: 8px;
-  background: #15191d;
-  padding: 24px;
-  box-shadow: 0 24px 90px rgba(0, 0, 0, 0.5);
+.section-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
 }
 
-.assessment-loading-modal.complete {
-  border-color: rgba(98, 212, 139, 0.72);
-}
-
-.assessment-loader {
-  position: relative;
-  height: 96px;
-  display: grid;
-  place-items: center;
-  margin-bottom: 8px;
-}
-
-.assessment-loader span {
-  position: absolute;
-  width: 78px;
-  height: 78px;
-  border: 2px solid transparent;
-  border-radius: 50%;
-  animation: assessment-orbit 1.45s linear infinite;
-}
-
-.assessment-loader span:nth-child(1) {
-  border-top-color: var(--accent);
-  border-left-color: rgba(231, 198, 106, 0.35);
-}
-
-.assessment-loader span:nth-child(2) {
-  width: 56px;
-  height: 56px;
-  border-right-color: var(--blue);
-  border-bottom-color: rgba(117, 183, 255, 0.3);
-  animation-duration: 1.05s;
-  animation-direction: reverse;
-}
-
-.assessment-loader span:nth-child(3) {
-  width: 22px;
-  height: 22px;
-  border: 0;
-  background: var(--green);
-  box-shadow: 0 0 28px rgba(98, 212, 139, 0.55);
-  animation: assessment-pulse 0.9s ease-in-out infinite alternate;
-}
-
-@keyframes assessment-orbit {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes assessment-pulse {
-  to {
-    transform: scale(0.72);
-    opacity: 0.68;
-  }
-}
-
-.assessment-complete-mark {
-  height: 96px;
-  display: grid;
-  place-items: center;
-  margin-bottom: 8px;
-  color: var(--green);
-  animation: assessment-complete-pop 0.3s ease-out both;
-}
-
-.assessment-loading-modal.complete .assessment-progress-bar span {
-  background: var(--green);
-}
-
-@keyframes assessment-complete-pop {
-  from {
-    transform: scale(0.82);
-    opacity: 0;
-  }
-
-  to {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-.assessment-loading-copy {
-  text-align: center;
-}
-
-.assessment-loading-copy h2 {
+.section-heading h2,
+.section-heading p {
   margin: 0;
-  font-size: 22px;
-  line-height: 1.3;
 }
 
-.assessment-loading-copy p {
-  min-height: 48px;
-  margin: 10px 0 20px;
-  color: var(--muted);
-  line-height: 1.6;
-}
-
-.assessment-progress-meta {
+.toggle-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
-  color: var(--muted);
-}
-
-.assessment-progress-meta strong {
+  gap: 8px;
   color: var(--text);
 }
 
-.assessment-progress-bar {
-  height: 12px;
+.toggle-row input {
+  width: auto;
+}
+
+.personal-guide {
   border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #0d0f11;
-  overflow: hidden;
-}
-
-.assessment-progress-bar span {
-  display: block;
-  height: 100%;
-  min-width: 8px;
-  border-radius: inherit;
-  background: linear-gradient(90deg, var(--accent), var(--blue), var(--green));
-  transition: width 0.24s ease;
-}
-
-.assessment-token-stats {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
-  margin-top: 14px;
-}
-
-.assessment-token-stats span {
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 5px 9px;
-  background: #0d0f11;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: rgba(32, 36, 42, 0.64);
   color: var(--muted);
-  font-size: 13px;
+}
+
+.personal-guide p {
+  margin: 0 0 8px;
+}
+
+.personal-guide a {
+  color: var(--accent);
+}
+
+.personal-guide ol {
+  margin: 8px 0 0;
+  padding-left: 22px;
 }
 
 .notice {

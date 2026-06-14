@@ -23,12 +23,15 @@ const {
   getCapturedDrills,
   getHistory,
   getInvites,
+  getRuntimeSettings,
+  getSettings,
   getMistakes,
   getSessionUser,
   getUserByUsername,
   initDb,
   loginUser,
   registerWithInvite,
+  setSettings,
   setAbility,
   updateCapturedDrillStreak,
   verifyPassword
@@ -113,6 +116,43 @@ test("auth sessions resolve until deleted or user is disabled", () => {
   const session = createAuthSession(user.id);
 
   assert.equal(getSessionUser(session.token).username, "session_user");
+});
+
+test("personal API keys are encrypted and not returned in public settings", () => {
+  const oldSecret = process.env.USER_API_KEY_ENCRYPTION_SECRET;
+  process.env.USER_API_KEY_ENCRYPTION_SECRET = "unit-test-secret";
+  try {
+    const user = createUser({ username: "personal_key_user", password: "password_123" });
+    setSettings({
+      ...getSettings(user.id),
+      personalProviderEnabled: true,
+      personalApiKey: "sk-test-personal-key"
+    }, user.role, user.id);
+
+    const publicSettings = getSettings(user.id);
+    assert.equal(publicSettings.personalProviderEnabled, true);
+    assert.equal(publicSettings.hasPersonalApiKey, true);
+    assert.equal("personalApiKey" in publicSettings, false);
+    assert.equal(getRuntimeSettings(user.id).personalApiKey, "sk-test-personal-key");
+  } finally {
+    if (oldSecret === undefined) delete process.env.USER_API_KEY_ENCRYPTION_SECRET;
+    else process.env.USER_API_KEY_ENCRYPTION_SECRET = oldSecret;
+  }
+});
+
+test("saving a personal API key requires encryption secret", () => {
+  const oldSecret = process.env.USER_API_KEY_ENCRYPTION_SECRET;
+  delete process.env.USER_API_KEY_ENCRYPTION_SECRET;
+  try {
+    const user = createUser({ username: "missing_secret_user", password: "password_123" });
+    assert.throws(
+      () => setSettings({ ...getSettings(user.id), personalApiKey: "sk-test" }, user.role, user.id),
+      /USER_API_KEY_ENCRYPTION_SECRET/
+    );
+  } finally {
+    if (oldSecret === undefined) delete process.env.USER_API_KEY_ENCRYPTION_SECRET;
+    else process.env.USER_API_KEY_ENCRYPTION_SECRET = oldSecret;
+  }
 });
 
 test("training data is isolated by user id", () => {

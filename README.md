@@ -1,6 +1,6 @@
 # English Writing Trainer
 
-A local web app for Chinese native speakers who want to practice Chinese-to-English writing. The app generates translation questions, grades answers with an OpenAI-compatible LM Studio endpoint, and stores training progress locally in SQLite.
+A local web app for Chinese native speakers who want to practice Chinese-to-English writing. The app generates translation questions, grades answers with Zhipu GLM-4.7-Flash, and stores training progress locally in SQLite.
 
 ## Features
 
@@ -11,13 +11,13 @@ A local web app for Chinese native speakers who want to practice Chinese-to-Engl
 - AI grading with verdicts, reference answers, error labels, explanations, and memory tips.
 - Progress dashboard with a radar chart, 30-day trend, error distribution, training records, and streak count.
 - Local username/password accounts with invite-only registration and per-user training data.
-- Admin management for invites, users, password resets, and global LM Studio settings.
+- Admin management for invites, users, password resets, and global GLM settings.
 
 ## Requirements
 
 - Node.js
 - npm
-- LM Studio with a loaded chat model that can handle Chinese and English writing feedback
+- Zhipu AI API key with access to `glm-4.7-flash`
 
 ## Getting Started
 
@@ -46,23 +46,23 @@ Open the app in your browser:
 http://localhost:3000
 ```
 
-## Configure LM Studio
+## Configure GLM-4.7-Flash
 
-1. Open LM Studio and load a chat model suitable for bilingual writing feedback.
-2. Start the local LM Studio server. The default endpoint is usually:
+1. Create a Zhipu AI API key and put it in `.env`:
 
-```text
-http://localhost:1234
+```bash
+ZAI_API_KEY=your-api-key
 ```
 
-3. Log in as an admin, then open the app's Settings page and configure:
+2. Log in as an admin, then open the app's Settings page and configure:
 
-- LM Studio base URL, for example `http://localhost:1234`
-- Model name, matching the model loaded in LM Studio
+- GLM API URL, default `https://open.bigmodel.cn/api/paas/v4`
+- Model name, default `glm-4.7-flash`
 - Temperature, default `0.3`
-- Daily question count. This is a per-user preference; LM Studio connection settings are admin-only.
+- Daily question count. This is a per-user preference; GLM connection settings are admin-only.
+- Application concurrency is fixed at `1` because the free GLM-4.7-Flash model only allows one concurrent request.
 
-4. Click the connection test button in Settings before starting an assessment or practice session.
+3. Restart the server after editing `.env`, then click the connection test button in Settings before starting an assessment or practice session.
 
 ## Data Storage
 

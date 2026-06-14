@@ -1,4 +1,4 @@
-import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getSettings, getSkillAbilities, initDb, setAbility, setSkillAbility } from "@/lib/db";
+import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getRuntimeSettings, getSkillAbilities, initDb, setAbility, setSkillAbility } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateAssessmentNarrativeStream } from "@/lib/llm";
 import { assessmentEvidenceDetails, assessmentFindings, calculateAssessmentMatrix, calculateAssessmentSkillAbilityUpdates, mergeAssessmentScore } from "@/lib/assessment";
@@ -37,13 +37,13 @@ export async function POST(request: Request) {
         });
 
         send("llm_start", {
-          title: "正在调用 LM Studio",
+          title: "正在调用 GLM",
           detail: "正在用结构化输出生成详细报告，进度会随流式输出更新。",
           percent: 85,
           totalQuestions: records.length
         });
         let lastProgressAt = 0;
-        const narrative = await generateAssessmentNarrativeStream(getSettings(user.id), {
+        const narrative = await generateAssessmentNarrativeStream(getRuntimeSettings(user.id), {
           totalQuestions: records.length,
           matrix,
           findings,
@@ -56,7 +56,7 @@ export async function POST(request: Request) {
           const llmPercent = Math.min(96, 85 + Math.round((Math.min(progress.estimatedTokens, tokenBudget) / tokenBudget) * 11));
           send("llm_delta", {
             title: progress.fallback ? "流式不可用，正在使用兼容模式" : "正在生成详细报告",
-            detail: progress.fallback ? "LM Studio 当前响应不支持流式统计，已切换为一次性生成。" : "正在接收 LM Studio 的流式输出并聚合结构化报告。",
+            detail: progress.fallback ? "GLM 当前响应不支持流式统计，已切换为一次性生成。" : "正在接收 GLM 的流式输出并聚合结构化报告。",
             percent: progress.fallback ? 90 : llmPercent,
             generatedChars: progress.generatedChars,
             estimatedTokens: progress.estimatedTokens,

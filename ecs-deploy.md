@@ -7,7 +7,7 @@
 建议规格：
 
 - Ubuntu 22.04 64 位
-- 至少 2 vCPU / 4 GiB RAM；如果 LM Studio 或本地大模型也跑在同一台机器，需要按模型显存/内存另算
+- 至少 2 vCPU / 4 GiB RAM
 - 安全组开放：`22/tcp`、`80/tcp`、`443/tcp`
 - 应用内部端口：`3000/tcp`，只给本机 Nginx 反代，不建议安全组直接暴露
 
@@ -188,25 +188,23 @@ sudo certbot --nginx -d <DOMAIN>
 sudo systemctl status certbot.timer
 ```
 
-## 7. LM Studio / OpenAI 兼容接口
+## 7. GLM-4.7-Flash 接口
 
-应用不会读 `.env` 配置 LLM；在网页 Settings 里填写并持久化到 SQLite。
+API Key 从 `.env` 读取；模型地址和模型名在网页 Settings 中保存到 SQLite。
 
-常见情况：
-
-- LM Studio 和应用同机：Settings 填 `http://127.0.0.1:1234`
-- LM Studio 在另一台机器：Settings 填 `http://<LM_STUDIO_HOST>:1234`
-- 如果通过公网访问 LM Studio，务必做访问控制，不要裸露 `1234/tcp`
-
-连通性检查：
+`.env` 中填写：
 
 ```bash
-curl http://127.0.0.1:1234/v1/models
+ZAI_API_KEY=your-api-key
 ```
 
-Settings 中还要填写实际加载的模型名。连接测试通过后再开始测评/练习。
+Settings 中填写：
 
-注意：项目已兼容部分 Qwen/LM Studio 响应把 JSON 放在 `message.reasoning_content`、`message.content` 为空的情况。
+- GLM API URL：`https://open.bigmodel.cn/api/paas/v4`
+- 模型名：`glm-4.7-flash`
+- 应用并发生成数：固定为 `1`，匹配免费模型并发限制
+
+连接测试通过后再开始测评/练习。
 
 ## 8. 数据备份
 
@@ -288,9 +286,9 @@ sudo chown -R app:app /home/app/apps/english-writing-trainer
 
 如果页面能打开但 AI 功能失败，优先查：
 
-- Settings 里的 Base URL 是否从 ECS 能访问
-- 模型名是否和 `/v1/models` 返回一致
-- LM Studio 是否允许来自 ECS 的连接
+- Settings 里的 GLM API URL 是否从 ECS 能访问
+- `.env` 中 `ZAI_API_KEY` 是否有效，修改后是否重启服务
+- 模型名是否为 `glm-4.7-flash`
 - `journalctl` 中是否有 JSON 解析或网络超时错误
 
 ## 11. 最小上线检查表

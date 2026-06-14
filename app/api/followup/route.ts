@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getSettings, initDb } from "@/lib/db";
+import { getRuntimeSettings, initDb } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { answerQuestionFollowUp } from "@/lib/llm";
 import { FollowUpMessage, GradeResult, Question } from "@/lib/types";
@@ -36,7 +36,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ message: "请输入要追问的问题。" }, { status: 400 });
     }
 
-    const answer = await answerQuestionFollowUp(getSettings(user.id), question, userAnswer, result, messages, prompt);
+    const answer = await answerQuestionFollowUp(getRuntimeSettings(user.id), question, userAnswer, result, messages, prompt);
     return NextResponse.json({ answer });
   } catch (error) {
     const authResponse = authErrorResponse(error);
