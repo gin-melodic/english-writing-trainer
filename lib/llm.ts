@@ -223,7 +223,7 @@ export type AssessmentNarrativeStreamProgress = {
 };
 
 function chatEndpoint(settings: RuntimeSettings) {
-  const baseUrl = usePersonalProvider(settings) ? settings.personalBaseUrl : settings.baseUrl;
+  const baseUrl = isPersonalProvider(settings) ? settings.personalBaseUrl : settings.baseUrl;
   return `${baseUrl.replace(/\/$/, "")}/chat/completions`;
 }
 
@@ -234,12 +234,12 @@ function getZaiApiKey() {
     || "";
 }
 
-function usePersonalProvider(settings: RuntimeSettings) {
+function isPersonalProvider(settings: RuntimeSettings) {
   return Boolean(settings.personalProviderEnabled && settings.personalApiKey);
 }
 
 function ensureChatSettings(settings: RuntimeSettings) {
-  if (usePersonalProvider(settings)) {
+  if (isPersonalProvider(settings)) {
     if (!settings.personalBaseUrl) throw new Error("请先填写 SiliconFlow API 地址");
     if (!settings.personalModel) throw new Error("请先填写 SiliconFlow 模型名称");
     if (!settings.personalApiKey) throw new Error("请先保存 SiliconFlow API Key");
@@ -259,19 +259,19 @@ function glmRequestTimeoutMs() {
 }
 
 function providerPayload(settings: RuntimeSettings, payload: ChatPayload): ChatPayload {
-  const model = usePersonalProvider(settings) ? settings.personalModel : settings.model;
+  const model = isPersonalProvider(settings) ? settings.personalModel : settings.model;
   const next: ChatPayload = {
     ...payload,
     model
   };
-  if (usePersonalProvider(settings)) {
+  if (isPersonalProvider(settings)) {
     delete next.thinking;
   }
   return next;
 }
 
 async function fetchChat(settings: RuntimeSettings, payload: ChatPayload) {
-  const apiKey = usePersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
+  const apiKey = isPersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
   const response = await fetch(chatEndpoint(settings), {
     method: "POST",
     headers: {
@@ -309,7 +309,7 @@ async function postChat(settings: RuntimeSettings, payload: ChatPayload) {
     }
     throw lastError;
   };
-  return usePersonalProvider(settings)
+  return isPersonalProvider(settings)
     ? run()
     : enqueue(run, settings.userId);
 }

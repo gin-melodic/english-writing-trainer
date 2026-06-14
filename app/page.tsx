@@ -314,15 +314,6 @@ function assessmentEvidence(question: Question, result?: GradeResult) {
   ];
 }
 
-function nextAssessmentStep(questions: Question[], answerRecords: Record<number, AnswerRecord>) {
-  const target = assessmentExtensionCandidates(questions, answerRecords)[0];
-  if (!target) return undefined;
-  return {
-    dimension: target.dimension,
-    difficulty: target.score < 45 ? 35 : target.score < 70 ? 55 : 75
-  };
-}
-
 function assessmentExtensionCandidates(questions: Question[], answerRecords: Record<number, AnswerRecord>) {
   return DIMENSIONS.map((dimension) => {
     let weighted = 0;

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 
 type Invite = {
@@ -94,7 +95,7 @@ export default function AdminPage() {
           <h1 className="title">管理员</h1>
           <p className="muted">邀请码和本地用户管理</p>
         </div>
-        <a className="button-link" href="/">返回训练</a>
+        <Link className="button-link" href="/">返回训练</Link>
       </div>
 
       {message && <div className="notice">{message}</div>}
