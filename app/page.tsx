@@ -138,7 +138,7 @@ const emptyState: AppState = {
     model: "glm-4.7-flash",
     temperature: 0.3,
     dailyCount: 20,
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: 20,
     personalProviderEnabled: false,
     personalBaseUrl: "https://api.siliconflow.cn/v1",
     personalModel: "deepseek-ai/DeepSeek-V4-Flash",
@@ -2232,7 +2232,7 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
         )}
         <label>每日练习题数<input type="number" min="10" max="50" value={draft.dailyCount} onChange={(e) => setDraft({ ...draft, dailyCount: Number(e.target.value) })} /></label>
         {isAdmin && (
-          <label>应用并发生成数<input type="number" min="1" max="1" value={1} disabled onChange={() => setDraft({ ...draft, maxConcurrentPredictions: 1 })} /><span className="field-hint">GLM-4.7-Flash 免费模型并发限制为 1，应用固定按 1 处理。</span></label>
+          <label>应用并发生成数<input type="number" min="1" max={draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "20" : "1"} value={draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? draft.maxConcurrentPredictions : 1} disabled={!draft.hasPersonalApiKey && !draft.personalApiKey?.trim()} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">{draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "独享模型启用后支持并发生成，范围 1-20，默认 20。" : "GLM-4.7-Flash 免费模型并发限制为 1；启用独享模型后可调整到 20。"}</span></label>
         )}
       </div>
       <div className="section personal-model-section">

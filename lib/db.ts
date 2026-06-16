@@ -12,6 +12,9 @@ const DEFAULT_GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
 const DEFAULT_GLM_MODEL = "glm-4.7-flash";
 const DEFAULT_PERSONAL_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_PERSONAL_MODEL = "deepseek-ai/DeepSeek-V4-Flash";
+const FREE_MODEL_CONCURRENCY = 1;
+const DEFAULT_PERSONAL_CONCURRENCY = 20;
+const MAX_PERSONAL_CONCURRENCY = 20;
 const LEGACY_LM_STUDIO_BASE_URLS = new Set([
   "http://localhost:1234",
   "http://127.0.0.1:1234"
@@ -150,6 +153,13 @@ function ensureAdminUser() {
 
 function ensureSettingsDefaults() {
   setSettings(getSettings(), "admin");
+}
+
+function normalizeLlmConcurrency(value: unknown, fallback = FREE_MODEL_CONCURRENCY) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(1, Math.min(MAX_PERSONAL_CONCURRENCY, Math.round(parsed)))
+    : fallback;
 }
 
 export function initDb() {
@@ -511,7 +521,7 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
     model: DEFAULT_GLM_MODEL,
     temperature: 0.3,
     dailyCount: 20,
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: FREE_MODEL_CONCURRENCY,
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,
@@ -520,7 +530,7 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
   const data = rows<{ key: string; value: string }>("SELECT key, value FROM settings;");
   for (const item of data) {
     if (item.key === "temperature") defaults.temperature = Number(item.value);
-    if (item.key === "maxConcurrentPredictions") defaults.maxConcurrentPredictions = Number(item.value);
+    if (item.key === "maxConcurrentPredictions") defaults.maxConcurrentPredictions = normalizeLlmConcurrency(item.value);
     if (item.key === "baseUrl") defaults.baseUrl = item.value;
     if (item.key === "model") defaults.model = item.value;
   }
@@ -530,7 +540,6 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
   if (!defaults.model.trim() || /^qwen/i.test(defaults.model.trim())) {
     defaults.model = DEFAULT_GLM_MODEL;
   }
-  defaults.maxConcurrentPredictions = 1;
   const userRows = rows<{ key: string; value: string }>(`
 SELECT key, value FROM user_settings WHERE user_id = ${Number(userId)};
 `);
@@ -541,6 +550,13 @@ SELECT key, value FROM user_settings WHERE user_id = ${Number(userId)};
     if (item.key === "personalApiKeyEncrypted") defaults.hasPersonalApiKey = Boolean(item.value);
   }
   defaults.personalProviderEnabled = defaults.hasPersonalApiKey;
+  if (defaults.personalProviderEnabled) {
+    defaults.maxConcurrentPredictions = defaults.maxConcurrentPredictions > FREE_MODEL_CONCURRENCY
+      ? normalizeLlmConcurrency(defaults.maxConcurrentPredictions, DEFAULT_PERSONAL_CONCURRENCY)
+      : DEFAULT_PERSONAL_CONCURRENCY;
+  } else {
+    defaults.maxConcurrentPredictions = FREE_MODEL_CONCURRENCY;
+  }
   return defaults;
 }
 
@@ -573,7 +589,9 @@ export function setSettings(settings: Settings & { personalApiKey?: string; clea
     model: actorRole === "admin" ? settings.model || DEFAULT_GLM_MODEL : current.model,
     temperature: actorRole === "admin" ? Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)) : current.temperature,
     dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: actorRole === "admin"
+      ? normalizeLlmConcurrency(settings.maxConcurrentPredictions, current.maxConcurrentPredictions)
+      : current.maxConcurrentPredictions,
     personalProviderEnabled: current.hasPersonalApiKey || Boolean(settings.personalApiKey?.trim()),
     personalBaseUrl: String(settings.personalBaseUrl || DEFAULT_PERSONAL_BASE_URL).trim() || DEFAULT_PERSONAL_BASE_URL,
     personalModel: String(settings.personalModel || DEFAULT_PERSONAL_MODEL).trim() || DEFAULT_PERSONAL_MODEL,
@@ -709,7 +727,7 @@ DELETE FROM user_settings WHERE user_id = ${Number(userId)};
     model: DEFAULT_GLM_MODEL,
     temperature: 0.3,
     dailyCount: 20,
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: FREE_MODEL_CONCURRENCY,
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,

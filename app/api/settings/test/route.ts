@@ -30,7 +30,7 @@ function normalizePersonalSettings(settings: Settings & { personalApiKey?: strin
     model: settings.model || "glm-4.7-flash",
     temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
     dailyCount: Math.min(50, Math.max(10, Number(settings.dailyCount) || 20)),
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: Math.max(1, Math.min(20, Math.round(Number(settings.maxConcurrentPredictions) || 20))),
     personalProviderEnabled: hasPersonalApiKey,
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",

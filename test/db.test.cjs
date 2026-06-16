@@ -140,6 +140,24 @@ test("personal API keys are encrypted and not returned in public settings", () =
   }
 });
 
+test("dedicated model settings default LLM concurrency to 20 and allow admin override", () => {
+  const oldSecret = process.env.USER_API_KEY_ENCRYPTION_SECRET;
+  process.env.USER_API_KEY_ENCRYPTION_SECRET = "unit-test-secret";
+  try {
+    const admin = createUser({ username: "personal_concurrency_admin", password: "password_123", role: "admin" });
+
+    assert.equal(getSettings(admin.id).maxConcurrentPredictions, 1);
+    setSettings({ ...getSettings(admin.id), personalApiKey: "sk-test-personal-key" }, admin.role, admin.id);
+    assert.equal(getSettings(admin.id).maxConcurrentPredictions, 20);
+
+    setSettings({ ...getSettings(admin.id), maxConcurrentPredictions: 6 }, admin.role, admin.id);
+    assert.equal(getSettings(admin.id).maxConcurrentPredictions, 6);
+  } finally {
+    if (oldSecret === undefined) delete process.env.USER_API_KEY_ENCRYPTION_SECRET;
+    else process.env.USER_API_KEY_ENCRYPTION_SECRET = oldSecret;
+  }
+});
+
 test("saving a personal API key requires encryption secret", () => {
   const oldSecret = process.env.USER_API_KEY_ENCRYPTION_SECRET;
   delete process.env.USER_API_KEY_ENCRYPTION_SECRET;

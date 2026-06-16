@@ -22,6 +22,8 @@ const DB_PATH = join(process.cwd(), "data", "trainer.db");
 const POLL_MS = 500;
 const RUNNING_STALE_SECONDS = 10 * 60;
 const HEARTBEAT_STALE_SECONDS = 30;
+const DEFAULT_CONCURRENCY = 1;
+const MAX_CONCURRENCY = 20;
 let queueTableEnsured = false;
 
 function sqlQuote(value: unknown) {
@@ -47,6 +49,13 @@ function rows<T>(sql: string): T[] {
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeConcurrency(value?: number | null) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(1, Math.min(MAX_CONCURRENCY, Math.round(parsed)))
+    : DEFAULT_CONCURRENCY;
 }
 
 function ensureQueueTable() {
@@ -147,17 +156,18 @@ WHERE id = ${Number(id)}
 `);
 }
 
-function acquireTask(id: number) {
+function acquireTask(id: number, maxConcurrent = DEFAULT_CONCURRENCY) {
   ensureQueueTable();
   heartbeatTask(id);
   cleanupStaleRunning();
+  const concurrency = normalizeConcurrency(maxConcurrent);
   const acquired = rows<{ id: number }>(`
 UPDATE llm_queue
 SET status = 'running', owner_pid = ${process.pid}, heartbeat_at = CURRENT_TIMESTAMP, started_at = CURRENT_TIMESTAMP
 WHERE id = ${Number(id)}
   AND status = 'queued'
-  AND NOT EXISTS (SELECT 1 FROM llm_queue WHERE status = 'running')
-  AND id = (SELECT id FROM llm_queue WHERE status = 'queued' ORDER BY id LIMIT 1)
+  AND (SELECT COUNT(*) FROM llm_queue WHERE status = 'running') < ${concurrency}
+  AND id IN (SELECT id FROM llm_queue WHERE status = 'queued' ORDER BY id LIMIT ${concurrency})
 RETURNING id;
 `);
   return acquired.length > 0;
@@ -173,9 +183,9 @@ WHERE id = ${Number(id)};
 `);
 }
 
-async function runWhenReady<T>(task: QueueTask<T>) {
+async function runWhenReady<T>(task: QueueTask<T>, maxConcurrent = DEFAULT_CONCURRENCY) {
   try {
-    while (!acquireTask(task.id)) {
+    while (!acquireTask(task.id, maxConcurrent)) {
       await delay(POLL_MS);
     }
     const heartbeat = setInterval(() => heartbeatTask(task.id), 5000);
@@ -194,7 +204,7 @@ async function runWhenReady<T>(task: QueueTask<T>) {
   }
 }
 
-export function enqueue<T>(run: () => Promise<T>, userId?: number | null): Promise<T> {
+export function enqueue<T>(run: () => Promise<T>, userId?: number | null, maxConcurrent = DEFAULT_CONCURRENCY): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const id = insertTask(userId);
     void runWhenReady({
@@ -202,7 +212,7 @@ export function enqueue<T>(run: () => Promise<T>, userId?: number | null): Promi
       run,
       resolve,
       reject
-    });
+    }, maxConcurrent);
   });
 }
 

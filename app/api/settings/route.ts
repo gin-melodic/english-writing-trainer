@@ -13,7 +13,7 @@ function normalizePersonalSettings(settings: Settings & { personalApiKey?: strin
   const personalApiKey = settings.personalApiKey?.trim();
   return {
     ...settings,
-    maxConcurrentPredictions: 1,
+    maxConcurrentPredictions: Math.max(1, Math.min(20, Math.round(Number(settings.maxConcurrentPredictions) || 20))),
     personalProviderEnabled: Boolean(personalApiKey),
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",

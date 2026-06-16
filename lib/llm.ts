@@ -258,6 +258,12 @@ function glmRequestTimeoutMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 90000;
 }
 
+function llmQueueConcurrency(settings: RuntimeSettings) {
+  if (!isPersonalProvider(settings)) return 1;
+  const parsed = Number(settings.maxConcurrentPredictions);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(20, Math.round(parsed))) : 20;
+}
+
 function providerPayload(settings: RuntimeSettings, payload: ChatPayload): ChatPayload {
   const model = isPersonalProvider(settings) ? settings.personalModel : settings.model;
   const next: ChatPayload = {
@@ -309,9 +315,7 @@ async function postChat(settings: RuntimeSettings, payload: ChatPayload) {
     }
     throw lastError;
   };
-  return isPersonalProvider(settings)
-    ? run()
-    : enqueue(run, settings.userId);
+  return enqueue(run, settings.userId, llmQueueConcurrency(settings));
 }
 
 function contentBlockToText(value: unknown) {

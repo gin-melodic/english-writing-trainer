@@ -77,3 +77,36 @@ VALUES (404, NULL, 'completed', NULL, datetime('now', '-2 hours'));
   assert.equal(remaining, 1);
   sql("DELETE FROM llm_queue WHERE user_id = 404;");
 });
+
+test("platform queue allows configured concurrent running tasks", async () => {
+  const release = deferred();
+  const events = [];
+
+  const taskA = enqueue(async () => {
+    events.push("a:start");
+    await release.promise;
+    events.push("a:end");
+    return "a";
+  }, 101, 2);
+  const taskB = enqueue(async () => {
+    events.push("b:start");
+    await release.promise;
+    events.push("b:end");
+    return "b";
+  }, 202, 2);
+  const taskC = enqueue(async () => {
+    events.push("c:start");
+    return "c";
+  }, 303, 2);
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(snapshot(101).runningCount, 2);
+  assert.equal(snapshot(101).pendingCount, 1);
+  assert.deepEqual(events, ["a:start", "b:start"]);
+
+  release.resolve();
+  assert.equal(await taskA, "a");
+  assert.equal(await taskB, "b");
+  assert.equal(await taskC, "c");
+  assert.deepEqual(events, ["a:start", "b:start", "a:end", "b:end", "c:start"]);
+});

@@ -60,7 +60,7 @@ ZAI_API_KEY=your-api-key
 - Model name, default `glm-4.7-flash`
 - Temperature, default `0.3`
 - Daily question count. This is a per-user preference; GLM connection settings are admin-only.
-- Application concurrency is fixed at `1` because the free GLM-4.7-Flash model only allows one concurrent request.
+- Application concurrency stays at `1` for the free GLM-4.7-Flash model. When a dedicated/personal model is enabled, LLM message generation concurrency defaults to `20` and can be lowered in Settings.
 
 3. Restart the server after editing `.env`, then click the connection test button in Settings before starting an assessment or practice session.
 
