@@ -17,10 +17,6 @@ const DEFAULT_LLM_PROVIDER: Settings["llmProvider"] = "zai";
 const FREE_MODEL_CONCURRENCY = 1;
 const DEFAULT_PERSONAL_CONCURRENCY = 20;
 const MAX_PERSONAL_CONCURRENCY = 20;
-const LEGACY_LM_STUDIO_BASE_URLS = new Set([
-  "http://localhost:1234",
-  "http://127.0.0.1:1234"
-]);
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
 let dbInitialized = false;
 
@@ -537,9 +533,6 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
     if (item.key === "maxConcurrentPredictions") defaults.maxConcurrentPredictions = normalizeLlmConcurrency(item.value);
     if (item.key === "baseUrl") defaults.baseUrl = item.value;
     if (item.key === "model") defaults.model = item.value;
-  }
-  if (LEGACY_LM_STUDIO_BASE_URLS.has(defaults.baseUrl.replace(/\/$/, ""))) {
-    defaults.baseUrl = DEFAULT_GLM_BASE_URL;
   }
   if (!defaults.model.trim() || /^qwen/i.test(defaults.model.trim())) {
     defaults.model = DEFAULT_GLM_MODEL;
