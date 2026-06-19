@@ -11,18 +11,23 @@ type SettingsBody = Partial<Settings> & {
 
 function normalizePersonalSettings(settings: Settings & { personalApiKey?: string; userId?: number }) {
   const personalApiKey = settings.personalApiKey?.trim();
+  const llmProvider: Settings["llmProvider"] = settings.llmProvider === "webllm" ? "webllm" : "openai-compatible";
   return {
     ...settings,
+    llmProvider,
     maxConcurrentPredictions: Math.max(1, Math.min(20, Math.round(Number(settings.maxConcurrentPredictions) || 20))),
-    personalProviderEnabled: Boolean(personalApiKey),
+    personalProviderEnabled: llmProvider === "webllm" || Boolean(personalApiKey),
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
-    hasPersonalApiKey: Boolean(personalApiKey),
+    webLlmModelBaseUrl: (settings.webLlmModelBaseUrl || "https://hf-mirror.com").replace(/\/+$/, ""),
+    hasPersonalApiKey: llmProvider === "webllm" || Boolean(personalApiKey),
     personalApiKey
   };
 }
 
 function shouldValidatePersonalSettings(current: Settings, body: SettingsBody) {
+  const targetProvider = body.llmProvider ?? current.llmProvider;
+  if (targetProvider === "webllm") return false;
   if (body.clearPersonalApiKey) return false;
   if (typeof body.personalApiKey === "string" && body.personalApiKey.trim()) return true;
   if (!current.hasPersonalApiKey) return false;

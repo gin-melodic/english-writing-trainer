@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { generateAssessmentNarrativeStream, generateDrillCard, generateQuestion, generateQuestions, generateStudyGuide, gradeAnswer, testConnection } = require("../lib/llm.ts");
+const { normalizeErrorTags } = require("../lib/errorTags.ts");
 const { publicQuestionSkills } = require("../lib/questionSafety.ts");
 
 process.env.ZAI_API_KEY = "test-api-key";
@@ -20,7 +21,7 @@ function settings() {
 
 function payload() {
   return {
-    totalQuestions: 1,
+    total_questions: 1,
     matrix: [
       { dimension: "时态", score: 60, confidence: 0.25, evidence_count: 1 },
       { dimension: "介词搭配", score: 80, confidence: 0, evidence_count: 0 },
@@ -29,7 +30,10 @@ function payload() {
       { dimension: "被动语态", score: 80, confidence: 0, evidence_count: 0 },
       { dimension: "冠词", score: 80, confidence: 0, evidence_count: 0 }
     ],
-    findings: ["第 1 题 时态 - 过去式不稳定"]
+    weakest_dimensions: [{ dimension: "时态", score: 60, confidence: 0.25, evidence_count: 1 }],
+    insufficient_evidence_dimensions: ["时态", "介词搭配", "定语从句", "连接词", "被动语态", "冠词"],
+    top_error_tags: [{ tag: "tense_error", count: 1 }],
+    top_skill_findings: [{ skill: "过去式不稳定", count: 1 }]
   };
 }
 
@@ -59,6 +63,17 @@ test("public question skills remove answer-revealing formulas", () => {
     "过去完成时判断",
     "完成时态语境"
   ]), ["过去完成时判断"]);
+});
+
+test("normalizeErrorTags maps legacy Chinese and English labels", () => {
+  assert.deepEqual(normalizeErrorTags([
+    "时态错误",
+    "冠词缺失",
+    "article missing",
+    "passive",
+    "完全未知",
+    "tense"
+  ]), ["tense_error", "missing_article", "passive_voice_error", "other"]);
 });
 
 test("connection test covers GLM structured, text, thinking, and streaming scenarios", async () => {
@@ -202,6 +217,19 @@ test("personal SiliconFlow settings use personal key and omit Z.ai thinking payl
   }
 });
 
+test("server LLM connection test rejects browser-only WebLLM", async () => {
+  await assert.rejects(
+    () => testConnection({
+      ...settings(),
+      llmProvider: "webllm",
+      personalProviderEnabled: true,
+      personalModel: "Llama-3.2-3B-Instruct-q4f32_1-MLC",
+      hasPersonalApiKey: false
+    }),
+    /WebLLM 只能在浏览器中运行/
+  );
+});
+
 test("connection test exposes failed response validation details", async () => {
   const originalFetch = global.fetch;
   global.fetch = async (_url, init) => {
@@ -312,6 +340,10 @@ test("assessment narrative stream sends GLM thinking and json mode", async () =>
     assert.equal(requests[0].stream, true);
     assert.equal("stream_options" in requests[0], false);
     assert.match(requests[0].messages[1].content, /assessment_narrative schema/);
+    assert.match(requests[0].messages[1].content, /ReportFacts/);
+    assert.match(requests[0].messages[1].content, /高频规范错误标签/);
+    assert.equal(requests[0].messages[1].content.includes("逐题结构化证据"), false);
+    assert.equal(requests[0].messages[1].content.includes("用户译文"), false);
     assert.equal(result.summary, "本次测评显示时态需要优先巩固。");
   } finally {
     global.fetch = originalFetch;
@@ -428,6 +460,9 @@ test("question generation can opt into thinking mode", async () => {
     assert.match(requests[0].messages[1].content, /不要写“was\/were \+ past participle”/);
     assert.equal(question.chinese, "昨天我完成了作业。");
     assert.deepEqual(question.skills, ["过去式动词"]);
+    assert.equal(typeof question.difficulty_b, "number");
+    assert.ok(Array.isArray(question.calibration_issues));
+    assert.equal(typeof question.calibration_passed, "boolean");
   } finally {
     global.fetch = originalFetch;
   }
@@ -604,6 +639,9 @@ test("batch question generation requests all questions in one structured call", 
     assert.equal(questions.length, 2);
     assert.equal(questions[0].dimension, "时态");
     assert.equal(questions[1].dimension, "被动语态");
+    assert.equal(typeof questions[0].difficulty_b, "number");
+    assert.ok(Array.isArray(questions[0].calibration_issues));
+    assert.equal(typeof questions[0].calibration_passed, "boolean");
   } finally {
     global.fetch = originalFetch;
   }
@@ -751,6 +789,8 @@ test("grading reconciles contradictory score verdict and severity fields", async
     }, "Someone sent the letter yesterday.");
 
     assert.equal(result.verdict, "wrong");
+    assert.deepEqual(result.error_types, ["tense", "passive"]);
+    assert.deepEqual(result.error_tags, ["tense_error", "passive_voice_error"]);
     assert.deepEqual(result.dimension_scores?.map((item) => [item.dimension, item.score]), [
       ["被动语态", 20],
       ["时态", 80],

@@ -8,6 +8,7 @@ type SettingsTestTarget = "global" | "personal";
 
 function normalizeGlobalSettings(settings: Settings & { userId?: number }) {
   return {
+    llmProvider: "zai" as const,
     baseUrl: settings.baseUrl || "https://open.bigmodel.cn/api/paas/v4",
     model: settings.model || "glm-4.7-flash",
     temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
@@ -16,6 +17,7 @@ function normalizeGlobalSettings(settings: Settings & { userId?: number }) {
     personalProviderEnabled: false,
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
+    webLlmModelBaseUrl: (settings.webLlmModelBaseUrl || "https://hf-mirror.com").replace(/\/+$/, ""),
     hasPersonalApiKey: false,
     userId: settings.userId
   };
@@ -23,9 +25,11 @@ function normalizeGlobalSettings(settings: Settings & { userId?: number }) {
 
 function normalizePersonalSettings(settings: Settings & { personalApiKey?: string; userId?: number }) {
   const personalApiKey = settings.personalApiKey?.trim();
-  const hasPersonalApiKey = Boolean(settings.hasPersonalApiKey || personalApiKey);
-  if (!personalApiKey) throw new Error("请先填写或保存 SiliconFlow API Key");
+  const llmProvider: Settings["llmProvider"] = settings.llmProvider === "webllm" ? "webllm" : "openai-compatible";
+  const hasPersonalApiKey = llmProvider === "webllm" || Boolean(settings.hasPersonalApiKey || personalApiKey);
+  if (llmProvider !== "webllm" && !personalApiKey) throw new Error("请先填写或保存个人模型 API Key");
   return {
+    llmProvider,
     baseUrl: settings.baseUrl || "https://open.bigmodel.cn/api/paas/v4",
     model: settings.model || "glm-4.7-flash",
     temperature: Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)),
@@ -34,6 +38,7 @@ function normalizePersonalSettings(settings: Settings & { personalApiKey?: strin
     personalProviderEnabled: hasPersonalApiKey,
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
+    webLlmModelBaseUrl: (settings.webLlmModelBaseUrl || "https://hf-mirror.com").replace(/\/+$/, ""),
     hasPersonalApiKey,
     personalApiKey,
     userId: settings.userId

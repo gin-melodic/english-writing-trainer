@@ -1,4 +1,5 @@
-import { Ability, AssessmentMatrixItem, DIMENSIONS, Dimension, DimensionScore, GradeResult, PracticeReport, Question, QuestionAnswerRecord, SkillAbility } from "./types";
+import { normalizeErrorTags } from "./errorTags";
+import { Ability, AssessmentMatrixItem, DIMENSIONS, Dimension, DimensionScore, ErrorTag, GradeResult, PracticeReport, Question, QuestionAnswerRecord, ReportFacts, SkillAbility } from "./types";
 
 function fallbackScore(verdict: GradeResult["verdict"]) {
   if (verdict === "correct") return 100;
@@ -224,6 +225,10 @@ function calibratedTarget(score: number, difficulty: number) {
   return Math.max(0, Math.min(100, difficulty + (score - 50) * 0.9));
 }
 
+function normalizedQuestionDifficulty(question: Question) {
+  return Math.max(1, Math.min(100, Number(question.difficulty_b ?? question.difficulty) || 50));
+}
+
 export function calculatePracticeAbilityUpdates(
   abilities: Ability[],
   question: Question,
@@ -232,7 +237,7 @@ export function calculatePracticeAbilityUpdates(
 ): Ability[] {
   const currentByDimension = new Map<Dimension, Ability>(abilities.map((item) => [item.dimension, item]));
   const updates = new Map<Dimension, Ability>();
-  const difficulty = Math.max(1, Math.min(100, Number(question.difficulty) || 50));
+  const difficulty = normalizedQuestionDifficulty(question);
   const difficultyInformation = 0.75 + difficulty / 200;
   const modeWeight = mode === "错题重练" || question.source === "mistake" ? 0.75 : 1;
 
@@ -300,7 +305,7 @@ export function calculatePracticeSkillAbilityUpdates(
 ): Array<Pick<SkillAbility, "dimension" | "skill" | "score" | "evidence_count">> {
   const currentByKey = new Map(skills.map((item) => [`${item.dimension}\u0000${item.skill}`, item]));
   const updates = new Map<string, Pick<SkillAbility, "dimension" | "skill" | "score" | "evidence_count">>();
-  const difficulty = Math.max(1, Math.min(100, Number(question.difficulty) || 50));
+  const difficulty = normalizedQuestionDifficulty(question);
   const modeWeight = mode === "错题重练" || question.source === "mistake" ? 0.75 : 1;
 
   for (const item of skillEvidence(question, result)) {
@@ -363,6 +368,53 @@ export function assessmentFindings(records: QuestionAnswerRecord[]) {
   });
 }
 
+function sortedCounts<T extends string>(counts: Map<T, number>) {
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans"));
+}
+
+export function buildReportFacts(records: QuestionAnswerRecord[], matrix: AssessmentMatrixItem[] = calculateAssessmentMatrix(records)): ReportFacts {
+  const errorCounts = new Map<ErrorTag, number>();
+  const skillCounts = new Map<string, number>();
+
+  for (const record of records) {
+    const tags = record.result.error_tags?.length
+      ? record.result.error_tags
+      : normalizeErrorTags(record.result.error_types ?? []);
+    for (const tag of tags) {
+      errorCounts.set(tag, (errorCounts.get(tag) ?? 0) + 1);
+    }
+    for (const skill of normalizeSkillLabels(record.result.skill_findings ?? [])) {
+      skillCounts.set(skill, (skillCounts.get(skill) ?? 0) + 1);
+    }
+  }
+
+  const weakest = [...matrix]
+    .filter((item) => item.evidence_count > 0)
+    .sort((a, b) => a.score - b.score || a.confidence - b.confidence || b.evidence_count - a.evidence_count)
+    .slice(0, 4)
+    .map((item) => ({
+      dimension: item.dimension,
+      score: item.score,
+      confidence: item.confidence,
+      evidence_count: item.evidence_count
+    }));
+
+  return {
+    total_questions: records.length,
+    matrix,
+    weakest_dimensions: weakest,
+    insufficient_evidence_dimensions: matrix
+      .filter((item) => item.evidence_count === 0 || item.confidence < 0.5)
+      .map((item) => item.dimension),
+    top_error_tags: sortedCounts(errorCounts)
+      .slice(0, 8)
+      .map(([tag, count]) => ({ tag, count })),
+    top_skill_findings: sortedCounts(skillCounts)
+      .slice(0, 8)
+      .map(([skill, count]) => ({ skill, count }))
+  };
+}
+
 function compactText(value: string, maxLength = 180) {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
@@ -373,7 +425,7 @@ export function assessmentEvidenceDetails(records: QuestionAnswerRecord[]) {
     question_index: record.question_index + 1,
     dimension: record.question.dimension,
     secondary_dimensions: record.question.secondary_dimensions ?? [],
-    difficulty: record.question.difficulty,
+    difficulty: normalizedQuestionDifficulty(record.question),
     grammar_focus: record.question.grammar_focus,
     skills: record.question.skills ?? [],
     rubric_points: record.question.rubric_points ?? [],

@@ -1,8 +1,14 @@
 import { addAssessmentReport, endSession, getAbilities, getQuestionAnswers, getRuntimeSettings, getSkillAbilities, initDb, setAbility, setSkillAbility } from "@/lib/db";
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { generateAssessmentNarrativeStream } from "@/lib/llm";
-import { assessmentEvidenceDetails, assessmentFindings, calculateAssessmentMatrix, calculateAssessmentSkillAbilityUpdates, mergeAssessmentScore } from "@/lib/assessment";
+import { assessmentFindings, buildReportFacts, calculateAssessmentMatrix, calculateAssessmentSkillAbilityUpdates, mergeAssessmentScore } from "@/lib/assessment";
 import { Dimension } from "@/lib/types";
+
+function logPreview(value: unknown) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > 240 ? `${compact.slice(0, 240)}...` : compact;
+}
 
 export async function POST(request: Request) {
   initDb();
@@ -13,14 +19,27 @@ export async function POST(request: Request) {
     return authErrorResponse(error) ?? new Response(JSON.stringify({ message: "请先登录。" }), { status: 401 });
   }
   const encoder = new TextEncoder();
+  const requestId = `assessment-finalize-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: Record<string, unknown>) => {
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        const payload = JSON.stringify(data);
+        console.info("POST /api/assessment/finalize SSE send", {
+          requestId,
+          event,
+          payloadChars: payload.length,
+          payload: logPreview(payload)
+        });
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${payload}\n\n`));
       };
       try {
         const { sessionId } = (await request.json()) as { sessionId?: number };
         if (!sessionId) throw new Error("缺少测评 sessionId");
+        console.info("POST /api/assessment/finalize stream started", {
+          requestId,
+          userId: user.id,
+          sessionId
+        });
 
         send("matrix", { title: "正在读取测评记录", detail: "正在汇总本次测评的逐题批改结果。", percent: 80 });
         const records = getQuestionAnswers(Number(sessionId), user.id).filter((item) => item.mode === "能力测评");
@@ -28,7 +47,7 @@ export async function POST(request: Request) {
 
         const matrix = calculateAssessmentMatrix(records);
         const findings = assessmentFindings(records);
-        const evidenceDetails = assessmentEvidenceDetails(records);
+        const reportFacts = buildReportFacts(records, matrix);
         send("matrix", {
           title: "能力矩阵已计算",
           detail: `已汇总 ${records.length} 道题和 ${findings.length} 条典型证据。`,
@@ -43,12 +62,7 @@ export async function POST(request: Request) {
           totalQuestions: records.length
         });
         let lastProgressAt = 0;
-        const narrative = await generateAssessmentNarrativeStream(getRuntimeSettings(user.id), {
-          totalQuestions: records.length,
-          matrix,
-          findings,
-          evidence_details: evidenceDetails
-        }, (progress) => {
+        const narrative = await generateAssessmentNarrativeStream(getRuntimeSettings(user.id), reportFacts, (progress) => {
           const now = Date.now();
           if (!progress.finalTokens && now - lastProgressAt < 200) return;
           lastProgressAt = now;
@@ -116,9 +130,13 @@ export async function POST(request: Request) {
           skillAbilities: getSkillAbilities(user.id)
         });
       } catch (error) {
-        console.error("POST /api/assessment/finalize failed", error);
+        console.error("POST /api/assessment/finalize failed", {
+          requestId,
+          error
+        });
         send("error", { message: error instanceof Error ? error.message : "测评报告生成失败" });
       } finally {
+        console.info("POST /api/assessment/finalize stream closed", { requestId });
         controller.close();
       }
     }

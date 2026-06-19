@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const {
   assessmentEvidenceDetails,
   assessmentFindings,
+  buildReportFacts,
   calculateAssessmentSkillAbilityUpdates,
   calculateAssessmentMatrix,
   calculatePracticeReport,
@@ -13,6 +14,7 @@ const {
   calculatePracticeSkillAbilityUpdates,
   mergeAssessmentScore
 } = require("../lib/assessment.ts");
+const { calibrateGeneratedQuestion } = require("../lib/questionCalibration.ts");
 
 function record(overrides) {
   return {
@@ -255,6 +257,69 @@ test("calculatePracticeAbilityUpdates uses calibrated evidence instead of fixed 
     { dimension: "被动语态", score: 50.31, evidence_count: 1 },
     { dimension: "时态", score: 60.15, evidence_count: 1 }
   ]);
+});
+
+test("calculatePracticeAbilityUpdates prefers difficulty_b when available", () => {
+  const baseQuestion = {
+    chinese: "这封信昨天被寄出了。",
+    answers: ["The letter was sent yesterday."],
+    grammar_focus: "一般过去时被动语态",
+    dimension: "被动语态",
+    difficulty: 20,
+    difficulty_b: 80
+  };
+  const result = {
+    verdict: "correct",
+    error_types: [],
+    reference_answers: ["The letter was sent yesterday."],
+    differences: [],
+    explanations: ["表达正确"],
+    dimension_scores: [
+      { dimension: "被动语态", score: 100, verdict: "correct", severity: "none", notes: "被动语态完整。" }
+    ]
+  };
+
+  const withCalibrated = calculatePracticeAbilityUpdates([{ dimension: "被动语态", score: 50 }], baseQuestion, result)[0];
+  const fallback = calculatePracticeAbilityUpdates([{ dimension: "被动语态", score: 50 }], { ...baseQuestion, difficulty_b: undefined }, result)[0];
+
+  assert.ok(withCalibrated.score > fallback.score);
+});
+
+test("calibrateGeneratedQuestion estimates difficulty and reports issues", () => {
+  const simple = calibrateGeneratedQuestion({
+    chinese: "我昨天迟到了。",
+    answers: ["I was late yesterday."],
+    grammar_focus: "一般过去时",
+    dimension: "时态",
+    skills: ["过去时间判断"],
+    rubric_points: ["谓语使用过去式"],
+    difficulty: 30
+  }, 30);
+  const complex = calibrateGeneratedQuestion({
+    chinese: "虽然这封邮件昨天已经被经理回复了，但我今天早上才看到。",
+    answers: ["Although this email had been replied to by the manager yesterday, I didn't see it until this morning."],
+    grammar_focus: "让步状语从句 + 过去完成时被动语态",
+    dimension: "被动语态",
+    secondary_dimensions: ["连接词", "时态"],
+    skills: ["被动语态", "让步关系", "过去完成时"],
+    rubric_points: ["使用被动结构", "表达虽然关系"],
+    difficulty: 75
+  }, 75);
+  const mismatch = calibrateGeneratedQuestion({
+    chinese: "这本书在桌子上。",
+    answers: ["The book is on the table."],
+    grammar_focus: "一般过去时",
+    dimension: "冠词",
+    skills: ["过去时间判断"],
+    difficulty: 90
+  }, 90);
+
+  assert.ok(simple.difficulty_b < complex.difficulty_b);
+  assert.ok(simple.difficulty_b >= 1 && simple.difficulty_b <= 100);
+  assert.ok(complex.difficulty_b >= 1 && complex.difficulty_b <= 100);
+  assert.ok(mismatch.issues.includes("dimension_mismatch"));
+  assert.ok(mismatch.issues.includes("difficulty_out_of_range"));
+  assert.equal(mismatch.passed, false);
 });
 
 test("calculatePracticeAbilityUpdates starts uncovered dimensions from neutral evidence", () => {
@@ -576,6 +641,43 @@ test("assessmentEvidenceDetails keeps structured per-question diagnosis fields",
     explanations: ["yesterday 表示过去时间，动词需要用过去式。"],
     skill_findings: ["时间状语 yesterday 与动词形式不匹配"]
   });
+});
+
+test("buildReportFacts aggregates normalized tags and falls back for old records", () => {
+  const records = [
+    record({
+      result: {
+        verdict: "wrong",
+        error_types: ["时态错误", "passive"],
+        reference_answers: ["I finished my homework yesterday."],
+        differences: [],
+        explanations: ["时态错误"],
+        skill_findings: ["过去式动词不稳定"]
+      }
+    }),
+    record({
+      question_index: 1,
+      result: {
+        verdict: "wrong",
+        error_types: ["article missing"],
+        error_tags: ["missing_article"],
+        reference_answers: ["I finished my homework yesterday."],
+        differences: [],
+        explanations: ["冠词缺失"],
+        skill_findings: ["过去式动词不稳定", "冠词特指不稳定"]
+      }
+    })
+  ];
+  const facts = buildReportFacts(records, calculateAssessmentMatrix(records));
+
+  assert.equal(facts.total_questions, 2);
+  assert.deepEqual(facts.top_error_tags, [
+    { tag: "missing_article", count: 1 },
+    { tag: "passive_voice_error", count: 1 },
+    { tag: "tense_error", count: 1 }
+  ]);
+  assert.deepEqual(facts.top_skill_findings[0], { skill: "过去式动词不稳定", count: 2 });
+  assert.ok(facts.insufficient_evidence_dimensions.includes("介词搭配"));
 });
 
 test("calculateAssessmentMatrix stays high when normalized correct evidence is high", () => {

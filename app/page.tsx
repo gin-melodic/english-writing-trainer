@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { BarChart3, BookOpenCheck, CheckCircle2, ClipboardList, Dumbbell, Eye, GraduationCap, History, LogOut, MessageCircle, MessageSquarePlus, RotateCcw, Send, Settings as SettingsIcon, Shield, Target, Trash2, X } from "lucide-react";
 import AbilityMotionField from "./AbilityMotionField";
 import { publicQuestionSkills } from "@/lib/questionSafety";
+import { answerWebLlmFollowUp, generateWebLlmDrillCard, generateWebLlmQuestions, generateWebLlmStudyGuide, gradeWebLlmAnswer, testWebLlmConnection } from "@/lib/webllmClient";
 import { Ability, AbilityHistory, AssessmentReport, CapturedDrill, DIMENSIONS, Dimension, DrillCard, FollowUpMessage, GradeResult, Mistake, PracticeReport, Question, Settings, SkillAbility, StudyGuide, TrainingRecord } from "@/lib/types";
 
 type View = "能力测评" | "每日练习" | "专项训练" | "错题重练" | "数据统计" | "设置";
@@ -58,6 +59,20 @@ type AssessmentFinalizeEvent = {
   report?: AssessmentReport;
   abilities?: Ability[];
   skillAbilities?: SkillAbility[];
+};
+type TextStreamEvent = {
+  content?: string;
+  answer?: string;
+  message?: string;
+  generatedChars?: number;
+  estimatedTokens?: number;
+  tokensPerSecond?: number;
+  finalTokens?: number;
+};
+type StreamLogItem = {
+  time: string;
+  level: "info" | "error";
+  message: string;
 };
 type ConnectionTestItem = {
   key: string;
@@ -134,6 +149,7 @@ type AppState = {
 const emptyState: AppState = {
   user: null,
   settings: {
+    llmProvider: "zai",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     model: "glm-4.7-flash",
     temperature: 0.3,
@@ -142,6 +158,7 @@ const emptyState: AppState = {
     personalProviderEnabled: false,
     personalBaseUrl: "https://api.siliconflow.cn/v1",
     personalModel: "deepseek-ai/DeepSeek-V4-Flash",
+    webLlmModelBaseUrl: "https://hf-mirror.com",
     hasPersonalApiKey: false
   },
   abilities: DIMENSIONS.map((dimension) => ({ dimension, score: 50, evidence_count: 0 })),
@@ -230,7 +247,22 @@ async function readSseStream(response: Response, onEvent: (event: string, data: 
       .join("\n")
       .trim();
     if (!dataText) return;
-    onEvent(event, JSON.parse(dataText) as AssessmentFinalizeEvent);
+    try {
+      const data = JSON.parse(dataText) as AssessmentFinalizeEvent;
+      console.info("Assessment SSE event received", {
+        event,
+        data: streamLogPreview(dataText)
+      });
+      onEvent(event, data);
+    } catch (parseError) {
+      console.error("Assessment SSE JSON parse failed", {
+        event,
+        rawEvent,
+        dataText,
+        parseError
+      });
+      throw new Error(`测评 SSE JSON 解析失败：${parseError instanceof Error ? parseError.message : "未知解析错误"}`);
+    }
   }
 
   while (true) {
@@ -244,6 +276,74 @@ async function readSseStream(response: Response, onEvent: (event: string, data: 
     if (done) break;
   }
   if (buffer.trim()) handleEvent(buffer);
+}
+
+function streamLogPreview(text: string) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > 260 ? `${compact.slice(0, 260)}...` : compact;
+}
+
+async function readTextSseStream(
+  response: Response,
+  onEvent: (event: string, data: TextStreamEvent) => void,
+  onLog?: (level: StreamLogItem["level"], message: string) => void
+) {
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.message || "请求失败");
+  }
+  if (!response.body) throw new Error("服务器没有返回数据流");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventCount = 0;
+  let totalBytes = 0;
+
+  function handleEvent(rawEvent: string) {
+    const lines = rawEvent.split(/\r?\n/);
+    const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim() || "message";
+    const dataText = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!dataText) return;
+    eventCount += 1;
+    let data: TextStreamEvent;
+    try {
+      data = JSON.parse(dataText) as TextStreamEvent;
+    } catch (parseError) {
+      console.error("Follow-up SSE JSON parse failed", {
+        event,
+        rawEvent,
+        dataText,
+        parseError
+      });
+      onLog?.("error", `SSE JSON 解析失败：event=${event}，data=${streamLogPreview(dataText)}`);
+      throw new Error(`SSE JSON 解析失败：${parseError instanceof Error ? parseError.message : "未知解析错误"}`);
+    }
+    const contentLength = typeof data.content === "string"
+      ? data.content.length
+      : typeof data.answer === "string" ? data.answer.length : 0;
+    onLog?.("info", `收到 ${event} #${eventCount}，片段 ${contentLength} 字符，累计 ${data.generatedChars ?? "-"} 字符，token≈${data.estimatedTokens ?? "-"}`);
+    if (event === "error") throw new Error(data.message || "流式输出失败");
+    onEvent(event, data);
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) {
+      totalBytes += value.byteLength;
+      buffer += decoder.decode(value, { stream: !done });
+      onLog?.("info", `读取 ${value.byteLength} bytes，累计 ${totalBytes} bytes，缓冲 ${buffer.length} 字符`);
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() ?? "";
+      events.forEach(handleEvent);
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) handleEvent(buffer);
+  onLog?.("info", `流结束，共 ${eventCount} 个事件，${totalBytes} bytes`);
 }
 
 function errorMessage(err: unknown, fallback: string) {
@@ -399,6 +499,102 @@ function weakSkillsForDimension(skillAbilities: SkillAbility[], dimension: Dimen
     .slice(0, limit);
 }
 
+function normalizeCodeFenceLanguage(language: string) {
+  return language.trim().replace(/[^a-z0-9_-]/gi, "").slice(0, 24).toLowerCase();
+}
+
+function renderInlineMarkdown(text: string) {
+  const parts = text.split(/(`[^`]+`)/g);
+  return parts.map((part, index) => part.startsWith("`") && part.endsWith("`")
+    ? <code key={index}>{part.slice(1, -1)}</code>
+    : <span key={index}>{part}</span>
+  );
+}
+
+function renderMarkdownBlocks(text: string) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const blocks: React.ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const fence = line.match(/^```([a-z0-9_-]*)\s*$/i);
+    if (fence) {
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const language = normalizeCodeFenceLanguage(fence[1] || "");
+      blocks.push(<pre key={blocks.length} className="formatted-code"><code>{language ? `${language}\n${codeLines.join("\n")}` : codeLines.join("\n")}</code></pre>);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      blocks.push(level === 1
+        ? <h3 key={blocks.length}>{renderInlineMarkdown(heading[2])}</h3>
+        : <h4 key={blocks.length}>{renderInlineMarkdown(heading[2])}</h4>
+      );
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*[-*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(<ul key={blocks.length}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ul>);
+      continue;
+    }
+
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+[.)]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(<ol key={blocks.length}>{items.map((item, itemIndex) => <li key={itemIndex}>{renderInlineMarkdown(item)}</li>)}</ol>);
+      continue;
+    }
+
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const paragraph: string[] = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^```/.test(lines[index]) && !/^(#{1,3})\s+/.test(lines[index]) && !/^\s*[-*]\s+/.test(lines[index]) && !/^\s*\d+[.)]\s+/.test(lines[index])) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push(<p key={blocks.length}>{renderInlineMarkdown(paragraph.join("\n"))}</p>);
+  }
+
+  return blocks.length ? blocks : <p>{text}</p>;
+}
+
+function FormattedLlmOutput({ content, streaming = false }: { content: string; streaming?: boolean }) {
+  const trimmed = content.trim();
+  if (!trimmed) return <p className="stream-placeholder">正在接收输出…</p>;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return <pre className="formatted-code json"><code>{JSON.stringify(parsed, null, 2)}</code></pre>;
+  } catch {
+    return (
+      <div className={`formatted-markdown${streaming ? " streaming" : ""}`}>
+        {renderMarkdownBlocks(content)}
+      </div>
+    );
+  }
+}
+
 function Radar({ abilities, onPick }: { abilities: Ability[]; onPick?: (dimension: Dimension) => void }) {
   const size = 320;
   const center = size / 2;
@@ -442,36 +638,102 @@ function Radar({ abilities, onPick }: { abilities: Ability[]; onPick?: (dimensio
   );
 }
 
-function Feedback({ question, userAnswer, result }: { question: Question; userAnswer: string; result: GradeResult }) {
+function Feedback({ question, userAnswer, result, settings, onWebLlmProgress }: {
+  question: Question;
+  userAnswer: string;
+  result: GradeResult;
+  settings: Settings;
+  onWebLlmProgress: (message: string) => void;
+}) {
   const [messages, setMessages] = useState<FollowUpMessage[]>([]);
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [streamLogs, setStreamLogs] = useState<StreamLogItem[]>([]);
+  const threadRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!threadRef.current) return;
+    threadRef.current.scrollTop = threadRef.current.scrollHeight;
+  }, [messages, loading]);
 
   async function askFollowUp() {
     const nextPrompt = prompt.trim();
     if (!nextPrompt || loading) return;
+    const appendStreamLog = (level: StreamLogItem["level"], message: string) => {
+      setStreamLogs((current) => [
+        ...current.slice(-39),
+        { level, message, time: new Date().toLocaleTimeString() }
+      ]);
+    };
     const nextMessages: FollowUpMessage[] = [...messages, { role: "user", content: nextPrompt }];
     setMessages(nextMessages);
     setPrompt("");
     setError("");
+    setStreamLogs([]);
     setLoading(true);
     try {
-      const data = await api<{ answer: string }>("/api/followup", {
+      if (settings.llmProvider === "webllm") {
+        appendStreamLog("info", "WebLLM 浏览器内推理开始");
+        const answer = await answerWebLlmFollowUp(settings, question, userAnswer, result, messages, nextPrompt, onWebLlmProgress);
+        setMessages([...nextMessages, { role: "assistant", content: answer }]);
+        appendStreamLog("info", `WebLLM 完成，返回 ${answer.length} 字符`);
+        return;
+      }
+
+      const assistantIndex = nextMessages.length;
+      let streamedAnswer = "";
+      setMessages([...nextMessages, { role: "assistant", content: "" }]);
+      appendStreamLog("info", "POST /api/followup stream=true");
+      const response = await fetch("/api/followup", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question,
           userAnswer,
           result,
           messages,
-          prompt: nextPrompt
+          prompt: nextPrompt,
+          stream: true
         })
       });
-      setMessages([...nextMessages, { role: "assistant", content: data.answer }]);
+      await readTextSseStream(response, (event, data) => {
+        if (event === "delta" && typeof data.content === "string") {
+          streamedAnswer += data.content;
+          setMessages((current) => current.map((message, index) => index === assistantIndex
+            ? { ...message, content: streamedAnswer }
+            : message
+          ));
+        }
+        if (event === "done" && typeof data.answer === "string") {
+          streamedAnswer = data.answer;
+          setMessages((current) => current.map((message, index) => index === assistantIndex
+            ? { ...message, content: data.answer || streamedAnswer }
+            : message
+          ));
+        }
+      }, appendStreamLog);
+      if (!streamedAnswer.trim()) {
+        appendStreamLog("error", "流式输出为空，回退到非流式请求");
+        const answer = (await api<{ answer: string }>("/api/followup", {
+          method: "POST",
+          body: JSON.stringify({
+            question,
+            userAnswer,
+            result,
+            messages,
+            prompt: nextPrompt
+          })
+        })).answer;
+        setMessages([...nextMessages, { role: "assistant", content: answer }]);
+        appendStreamLog("info", `非流式回退完成，返回 ${answer.length} 字符`);
+      }
     } catch (err) {
       setMessages(messages);
       setPrompt(nextPrompt);
-      setError(errorMessage(err, "追问失败"));
+      const message = errorMessage(err, "追问失败");
+      appendStreamLog("error", message);
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -514,11 +776,13 @@ function Feedback({ question, userAnswer, result }: { question: Question; userAn
       <div className="followup-panel">
         <div className="followup-title"><MessageCircle size={17} /><strong>继续追问</strong></div>
         {messages.length > 0 && (
-          <div className="followup-thread">
+          <div className="followup-thread" ref={threadRef}>
             {messages.map((message, index) => (
               <div className={`followup-message ${message.role}`} key={`${message.role}-${index}`}>
                 <span>{message.role === "user" ? "我" : "LLM"}</span>
-                <p>{message.content}</p>
+                {message.role === "assistant"
+                  ? <FormattedLlmOutput content={message.content} streaming={loading && index === messages.length - 1} />
+                  : <p>{message.content}</p>}
               </div>
             ))}
           </div>
@@ -531,6 +795,18 @@ function Feedback({ question, userAnswer, result }: { question: Question; userAn
           disabled={loading}
         />
         {error && <div className="notice compact">{error}</div>}
+        {streamLogs.length > 0 && (
+          <div className="stream-log-panel" aria-live="polite">
+            <strong>流式诊断</strong>
+            <div>
+              {streamLogs.map((item, index) => (
+                <p className={item.level} key={`${item.time}-${index}`}>
+                  <span>{item.time}</span>{item.message}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="actions">
           <button className="primary icon-button-text" onClick={askFollowUp} disabled={loading || !prompt.trim()}>
             <Send size={16} />
@@ -538,6 +814,27 @@ function Feedback({ question, userAnswer, result }: { question: Question; userAn
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function WebLlmProgressModal({ message }: { message: string }) {
+  if (!message) return null;
+  const percentMatch = message.match(/(\d+)%/);
+  const percent = percentMatch ? clampNumber(Number(percentMatch[1]), 0, 100) : undefined;
+  return (
+    <div className="webllm-progress-toast" role="status" aria-live="polite">
+      <div className="section-heading">
+        <div>
+          <h2>WebLLM 模型准备中</h2>
+          <p className="muted">首次运行会下载量化模型并缓存到浏览器 Cache Storage。</p>
+        </div>
+        <div className="status-pill">浏览器内推理</div>
+      </div>
+      <div className="webllm-progress-bar" aria-label="WebLLM 下载和初始化进度">
+        <span style={{ width: `${percent ?? 12}%` }} />
+      </div>
+      <p>{message}</p>
     </div>
   );
 }
@@ -557,6 +854,7 @@ export default function Home() {
   const [sessionStarted, setSessionStarted] = useState(false);
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
+  const [webLlmProgress, setWebLlmProgress] = useState("");
   const [progress, setProgress] = useState({ current: 0, total: 20 });
   const [beforeScores, setBeforeScores] = useState<Ability[]>(emptyState.abilities);
   const [showDelta, setShowDelta] = useState(false);
@@ -603,6 +901,10 @@ export default function Home() {
   useEffect(() => {
     refresh().catch((err) => setError(err.message));
   }, [refresh]);
+
+  useEffect(() => {
+    if (!loading) setWebLlmProgress("");
+  }, [loading]);
 
   useEffect(() => {
     let cancelled = false;
@@ -659,6 +961,17 @@ export default function Home() {
       : startMode === "错题重练"
         ? state.mistakes.filter((x) => x.correct_streak < 2).length
         : 20;
+  const usesWebLlm = state.settings.llmProvider === "webllm";
+
+  function reportWebLlmProgress(message: string) {
+    setWebLlmProgress(message);
+    setLoading(message);
+  }
+
+  function chooseBatchDimension(index: number) {
+    const ranked = [...state.abilities].sort((a, b) => a.score - b.score || a.evidence_count - b.evidence_count);
+    return ranked[index % ranked.length]?.dimension ?? DIMENSIONS[0];
+  }
 
   async function completeAssessmentProgress(title = "处理完成", detail = "结果已更新，正在进入下一步。") {
     setAssessmentProgress((prev) => prev ? {
@@ -729,6 +1042,30 @@ export default function Home() {
     setLoading(`AI 正在生成题目 ${from}-${to}/${nextTotal}…`);
     setPaperGenerationProgress(nextMode, questions.length, nextTotal, `AI 正在规划并生成第 ${from}-${to} 题。`);
     const previousQuestions = questions.map((question) => question.chinese);
+    if (usesWebLlm) {
+      const webSpecs = Array.from({ length: aiTotal }, (_, offset) => {
+        const index = questions.length + offset;
+        const nextAssessmentStep = assessmentStepAt(index);
+        const dimension = nextMode === "能力测评"
+          ? nextAssessmentStep.dimension
+          : nextMode === "专项训练"
+            ? specialDimension
+            : chooseBatchDimension(index);
+        const score = state.abilities.find((ability) => ability.dimension === dimension)?.score ?? 30;
+        const difficulty = nextMode === "能力测评" ? nextAssessmentStep.difficulty : Math.max(1, Math.min(100, Math.round(score + 8)));
+        const focusSkills = weakSkillsForDimension(state.skillAbilities, dimension).map((item) => item.skill);
+        return {
+          dimension,
+          difficulty,
+          focusSkills,
+          paperPosition: `第 ${index + 1}/${nextTotal} 题`
+        };
+      });
+      const webQuestions = await generateWebLlmQuestions(state.settings, webSpecs, true, previousQuestions, "", reportWebLlmProgress);
+      questions.push(...webQuestions);
+      setPaperGenerationProgress(nextMode, questions.length, nextTotal, `已生成 ${questions.length}/${nextTotal} 题。`);
+      return questions;
+    }
     const specs = Array.from({ length: aiTotal }, (_, offset) => {
       const index = questions.length + offset;
       const nextAssessmentStep = assessmentStepAt(index);
@@ -811,6 +1148,21 @@ export default function Home() {
     setPaperNotes((prev) => ({ ...prev, [index]: { ...prev[index], loading: true } }));
     try {
       const previousQuestions = questionQueue.map((item, itemIndex) => itemIndex === index ? "" : item.chinese).filter(Boolean);
+      if (usesWebLlm) {
+        const focusSkills = activeMode === "专项训练" ? weakSkillsForDimension(state.skillAbilities, current.dimension).map((item) => item.skill) : [];
+        const [question] = await generateWebLlmQuestions(state.settings, [{
+          dimension: current.dimension,
+          difficulty: current.difficulty,
+          focusSkills,
+          paperPosition: `第 ${index + 1}/${questionQueue.length} 题`
+        }], true, previousQuestions, paperNotes[index]?.reason ?? "", reportWebLlmProgress);
+        if (!question) {
+          setError("没有生成可替换的题目。");
+          return;
+        }
+        setQuestionQueue((prev) => prev.map((item, itemIndex) => itemIndex === index ? question : item));
+        return;
+      }
       const data = await api<QuestionResponse>("/api/question", {
         method: "POST",
         body: JSON.stringify({
@@ -847,6 +1199,12 @@ export default function Home() {
     setError("");
     setLoading("AI 正在生成专项学习内容…");
     try {
+      if (usesWebLlm) {
+        const guide = await generateWebLlmStudyGuide(state.settings, questionQueue, reportWebLlmProgress);
+        setStudyGuide(guide);
+        setStudyGuideOpen(true);
+        return;
+      }
       const data = await api<{ guide: StudyGuide }>("/api/study", {
         method: "POST",
         body: JSON.stringify({
@@ -927,11 +1285,15 @@ export default function Home() {
       });
     }
     try {
+      const localResult = usesWebLlm
+        ? await gradeWebLlmAnswer(state.settings, activeQuestion, activeRecord.answer, reportWebLlmProgress)
+        : undefined;
       const data = await api<{ result: GradeResult; abilities: Ability[]; skillAbilities: SkillAbility[] }>("/api/grade", {
         method: "POST",
         body: JSON.stringify({
           question: activeQuestion,
           answer: activeRecord.answer,
+          result: localResult,
           sessionId,
           mode: activeMode,
           questionIndex: progress.current,
@@ -977,6 +1339,21 @@ export default function Home() {
     try {
       setLoading(`AI 正在生成扩展题 1-${plan.length}/${plan.length}…`);
       const previousQuestions = questionQueue.map((item) => item.chinese);
+      if (usesWebLlm) {
+        const questions = await generateWebLlmQuestions(state.settings, plan.map((item, offset) => ({
+          dimension: item.dimension,
+          difficulty: item.difficulty,
+          paperPosition: `第 ${questionQueue.length + offset + 1}/${questionQueue.length + plan.length} 题`
+        })), true, previousQuestions, "", reportWebLlmProgress);
+        extensionQuestions.push(...questions);
+        if (extensionQuestions.length < 1) {
+          setError("扩展题生成失败，请稍后重试。");
+          return;
+        }
+        setAssessmentExtension({ phase: "preview", plan, questions: extensionQuestions, notes: {} });
+        setSessionStarted(false);
+        return;
+      }
       const data = await api<QuestionResponse>("/api/question", {
         method: "POST",
         body: JSON.stringify({
@@ -1110,6 +1487,14 @@ export default function Home() {
     }
     setCapture((prev) => ({ ...prev, loading: "正在生成表达卡…", error: "", saved: false }));
     try {
+      if (usesWebLlm) {
+        const card = await generateWebLlmDrillCard(state.settings, sourceCn, (message) => {
+          reportWebLlmProgress(message);
+          setCapture((prev) => ({ ...prev, loading: message || "正在生成表达卡…" }));
+        });
+        setCapture((prev) => ({ ...prev, card, sourceCn: card.source_cn, loading: "", error: "", saved: false }));
+        return;
+      }
       const data = await api<CaptureResponse>("/api/capture", {
         method: "POST",
         body: JSON.stringify({ action: "generate", source_cn: sourceCn })
@@ -1222,6 +1607,7 @@ export default function Home() {
 
   return (
     <div className="app" onKeyDown={onKeyDown}>
+      <WebLlmProgressModal message={webLlmProgress} />
       <aside className="sidebar">
         <div className="brand">中译英<br />自适应训练系统</div>
         {state.user && (
@@ -1406,7 +1792,15 @@ export default function Home() {
                   {!activeResult ? <button className="primary" onClick={submit} disabled={Boolean(loading) || !activeRecord.answer.trim()}>提交</button> : <button className="primary" onClick={() => nextQuestion()}>下一题</button>}
                 </div>
                 {activeMode !== "能力测评" && activeResult && <p className="muted">语法点说明：{activeQuestion.grammar_focus}</p>}
-                {activeMode !== "能力测评" && activeResult && <Feedback question={activeQuestion} userAnswer={activeRecord.answer} result={activeResult} />}
+                {activeMode !== "能力测评" && activeResult && (
+                  <Feedback
+                    question={activeQuestion}
+                    userAnswer={activeRecord.answer}
+                    result={activeResult}
+                    settings={state.settings}
+                    onWebLlmProgress={reportWebLlmProgress}
+                  />
+                )}
               </>
             )}
           </section>
@@ -1417,7 +1811,7 @@ export default function Home() {
         )}
 
         {view === "设置" && !assessment && (
-          <SettingsPanel draft={settingsDraft} setDraft={setSettingsDraft} refresh={refresh} setError={setError} error={error} isAdmin={state.user?.role === "admin"} />
+          <SettingsPanel draft={settingsDraft} setDraft={setSettingsDraft} refresh={refresh} setError={setError} error={error} isAdmin={state.user?.role === "admin"} onWebLlmProgress={reportWebLlmProgress} />
         )}
 
         <button className="capture-fab" type="button" onClick={openCapture} aria-label="快速捕捉表达">
@@ -1441,9 +1835,9 @@ function SystemStatus({ status, settings, onOpenSettings }: {
   settings: Settings;
   onOpenSettings: () => void;
 }) {
-  const personalReady = settings.hasPersonalApiKey;
+  const personalReady = settings.llmProvider === "webllm" || settings.hasPersonalApiKey;
   const statusText = personalReady
-    ? "个人模型已启用"
+    ? settings.llmProvider === "webllm" ? "WebLLM 已启用" : "个人模型已启用"
     : status.runningCount > 0
       ? "处理中"
       : status.pendingCount > 0 ? "排队中" : "空闲";
@@ -1453,9 +1847,9 @@ function SystemStatus({ status, settings, onOpenSettings }: {
       <div className="status-pill">{statusText}</div>
       <p>平台队列：{status.runningCount ? "处理中" : "空闲"} · 排队 {status.pendingCount}</p>
       <p>我的排位：{status.myPosition === 0 ? "正在处理" : status.myPosition ? `第 ${status.myPosition} 位` : "无排队任务"}</p>
-      <p>独享模型：{personalReady ? "已启用" : "未启用"}</p>
+      <p>独享模型：{personalReady ? settings.llmProvider === "webllm" ? "WebLLM" : "已启用" : "未启用"}</p>
       {!personalReady && status.pendingCount > 0 && (
-        <button type="button" onClick={onOpenSettings}>配置 SiliconFlow 免平台排队</button>
+        <button type="button" onClick={onOpenSettings}>配置本地或个人模型免平台排队</button>
       )}
     </div>
   );
@@ -2155,18 +2549,21 @@ function PracticeReportView({ report }: { report: PracticeReport }) {
   );
 }
 
-function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
+function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onWebLlmProgress }: {
   draft: SettingsDraft;
   setDraft: (value: SettingsDraft) => void;
   refresh: () => Promise<void>;
   setError: (value: string) => void;
   error: string;
   isAdmin: boolean;
+  onWebLlmProgress: (message: string) => void;
 }) {
   const [message, setMessage] = useState("");
   const [testResult, setTestResult] = useState<{ target: SettingsTestTarget; result: ConnectionTestResult } | null>(null);
   const [showPersonalGuide, setShowPersonalGuide] = useState(false);
-  const canTestPersonalModel = Boolean(draft.hasPersonalApiKey || draft.personalApiKey?.trim());
+  const usesWebLlm = draft.llmProvider === "webllm";
+  const usesPersonalModel = draft.llmProvider === "openai-compatible" || usesWebLlm;
+  const canTestPersonalModel = usesWebLlm || Boolean(draft.hasPersonalApiKey || draft.personalApiKey?.trim());
   const renderConnectionTestResult = (target: SettingsTestTarget) => testResult?.target === target && (
     <div className="connection-test-list">
       {testResult.result.tests.map((item) => (
@@ -2182,7 +2579,7 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
   );
   async function save() {
     setTestResult(null);
-    const personalKeyChanged = Boolean(draft.personalApiKey?.trim());
+    const personalKeyChanged = !usesWebLlm && Boolean(draft.personalApiKey?.trim());
     setMessage(personalKeyChanged ? "正在验证个人 API Key…" : "正在保存设置…");
     try {
       const saved = await api<Settings>("/api/settings", { method: "PUT", body: JSON.stringify(draft) });
@@ -2194,9 +2591,19 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
     }
   }
   async function test(target: SettingsTestTarget) {
-    setMessage(target === "personal" ? "正在验证独享模型…" : "正在测试免费模型…");
+    setMessage(target === "personal" ? usesWebLlm ? "正在加载并验证 WebLLM 模型…" : "正在验证独享模型…" : "正在测试免费模型…");
     setTestResult(null);
     try {
+      if (target === "personal" && usesWebLlm) {
+        const result = await testWebLlmConnection(draft, (message) => {
+          onWebLlmProgress(message);
+          setMessage(message);
+        });
+        setTestResult({ target, result });
+        onWebLlmProgress("");
+        setMessage("WebLLM 模型验证成功，浏览器内推理可用");
+        return;
+      }
       const res = await fetch("/api/settings/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2208,6 +2615,7 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
       if (!res.ok) throw new Error(data.message || "连接失败");
       setMessage(target === "personal" ? "独享模型验证成功，所有测试项已通过" : "免费模型连接成功，所有测试项已通过");
     } catch (err) {
+      if (usesWebLlm) onWebLlmProgress("");
       setMessage(err instanceof Error ? err.message : "连接失败");
     }
   }
@@ -2225,6 +2633,11 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
       <div className="section form-grid">
         {isAdmin && (
           <>
+            <label>默认 Provider<select value={draft.llmProvider} onChange={(e) => setDraft({ ...draft, llmProvider: e.target.value as Settings["llmProvider"] })}>
+              <option value="zai">Z.ai GLM-4.7-Flash</option>
+              <option value="openai-compatible">OpenAI 兼容个人接口</option>
+              <option value="webllm">WebLLM</option>
+            </select></label>
             <label>GLM API 地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
             <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} placeholder="glm-4.7-flash" /></label>
             <label>Temperature<input type="number" min="0" max="1" step="0.1" value={draft.temperature} onChange={(e) => setDraft({ ...draft, temperature: Number(e.target.value) })} /></label>
@@ -2232,46 +2645,74 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin }: {
         )}
         <label>每日练习题数<input type="number" min="10" max="50" value={draft.dailyCount} onChange={(e) => setDraft({ ...draft, dailyCount: Number(e.target.value) })} /></label>
         {isAdmin && (
-          <label>应用并发生成数<input type="number" min="1" max={draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "20" : "1"} value={draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? draft.maxConcurrentPredictions : 1} disabled={!draft.hasPersonalApiKey && !draft.personalApiKey?.trim()} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">{draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "独享模型启用后支持并发生成，范围 1-20，默认 20。" : "GLM-4.7-Flash 免费模型并发限制为 1；启用独享模型后可调整到 20。"}</span></label>
+          <label>应用并发生成数<input type="number" min="1" max={usesPersonalModel || draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "20" : "1"} value={usesPersonalModel || draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? draft.maxConcurrentPredictions : 1} disabled={!usesPersonalModel && !draft.hasPersonalApiKey && !draft.personalApiKey?.trim()} onChange={(e) => setDraft({ ...draft, maxConcurrentPredictions: Number(e.target.value) })} /><span className="field-hint">{usesPersonalModel || draft.hasPersonalApiKey || draft.personalApiKey?.trim() ? "独享模型启用后支持并发生成，范围 1-20，默认 20。" : "GLM-4.7-Flash 免费模型并发限制为 1；启用独享模型后可调整到 20。"}</span></label>
         )}
       </div>
       <div className="section personal-model-section">
         <div className="section-heading">
           <div>
-            <h2>独享模型</h2>
-            <p className="muted">填写 SiliconFlow API Key 并验证通过后自动启用；清除 Key 后自动关闭。</p>
+            <h2>本地 / 独享模型</h2>
+            <p className="muted">{usesWebLlm ? "WebLLM 在当前浏览器内通过 WebGPU 推理，不需要服务器地址或 API Key。" : "OpenAI 兼容接口需要 API Key，服务器会按 chat completions 请求调用。"}</p>
           </div>
-          <div className="status-pill">{draft.hasPersonalApiKey ? "已启用" : draft.personalApiKey?.trim() ? "待验证" : "未启用"}</div>
+          <div className="status-pill">{usesWebLlm ? "WebLLM" : draft.hasPersonalApiKey ? "已启用" : draft.personalApiKey?.trim() ? "待验证" : "未启用"}</div>
         </div>
         <div className="form-grid">
-          <label>SiliconFlow API 地址<input value={draft.personalBaseUrl} onChange={(e) => setDraft({ ...draft, personalBaseUrl: e.target.value })} placeholder="https://api.siliconflow.cn/v1" /></label>
-          <label>模型名称<input value={draft.personalModel} onChange={(e) => setDraft({ ...draft, personalModel: e.target.value })} placeholder="deepseek-ai/DeepSeek-V4-Flash" /></label>
-          <label>
+          <label>Provider<select value={draft.llmProvider === "webllm" ? "webllm" : "openai-compatible"} onChange={(e) => {
+            const llmProvider = e.target.value as Settings["llmProvider"];
+            setDraft({
+              ...draft,
+              llmProvider,
+              personalModel: llmProvider === "webllm" && !draft.personalModel.includes("-MLC")
+                ? "Llama-3.2-3B-Instruct-q4f32_1-MLC"
+                : draft.personalModel
+            });
+          }}>
+            <option value="openai-compatible">OpenAI 兼容接口</option>
+            <option value="webllm">WebLLM</option>
+          </select></label>
+          {!usesWebLlm && <label>OpenAI 兼容 API 地址<input value={draft.personalBaseUrl} onChange={(e) => setDraft({ ...draft, personalBaseUrl: e.target.value })} placeholder="https://api.siliconflow.cn/v1" /></label>}
+          <label>{usesWebLlm ? "WebLLM 模型 ID" : "模型名称"}<input value={draft.personalModel} onChange={(e) => setDraft({ ...draft, personalModel: e.target.value })} placeholder={usesWebLlm ? "Llama-3.2-3B-Instruct-q4f32_1-MLC" : "deepseek-ai/DeepSeek-V4-Flash"} /><span className="field-hint">{usesWebLlm ? "首次使用会下载并缓存模型权重；模型 ID 必须是 WebLLM 支持的 MLC 模型。" : "填写服务商提供的 chat completions 模型名称。"}</span></label>
+          {usesWebLlm && <label>WebLLM 模型下载镜像<input value={draft.webLlmModelBaseUrl} onChange={(e) => setDraft({ ...draft, webLlmModelBaseUrl: e.target.value })} placeholder="https://hf-mirror.com" /><span className="field-hint">用于替换 WebLLM 模型权重的 huggingface.co 下载源；大陆网络建议使用 https://hf-mirror.com。</span></label>}
+          {!usesWebLlm && <label>
             API Key
             <input
               type="password"
               value={draft.personalApiKey || ""}
               onChange={(e) => setDraft({ ...draft, personalApiKey: e.target.value, clearPersonalApiKey: false })}
-              placeholder={draft.hasPersonalApiKey ? "已保存，输入新 Key 可替换" : "粘贴 SiliconFlow API Key"}
+              placeholder={draft.hasPersonalApiKey ? "已保存，输入新 Key 可替换" : "粘贴 API Key"}
             />
             <span className="field-hint">保存时会先验证，验证通过后服务器加密保存个人 Key</span>
-          </label>
+          </label>}
         </div>
         <div className="actions" style={{ justifyContent: "flex-start" }}>
           <button type="button" className="primary" onClick={() => test("personal")} disabled={!canTestPersonalModel}>验证独享模型</button>
-          <button type="button" onClick={() => setShowPersonalGuide((value) => !value)}>{showPersonalGuide ? "收起教程" : "查看 SiliconFlow 教程"}</button>
+          <button type="button" onClick={() => setShowPersonalGuide((value) => !value)}>{showPersonalGuide ? "收起教程" : usesWebLlm ? "查看 WebLLM 说明" : "查看 SiliconFlow 教程"}</button>
           {draft.hasPersonalApiKey && <button type="button" onClick={() => setDraft({ ...draft, personalProviderEnabled: false, personalApiKey: "", clearPersonalApiKey: true, hasPersonalApiKey: false })}>清除个人 Key</button>}
         </div>
         {renderConnectionTestResult("personal")}
         {showPersonalGuide && (
           <div className="personal-guide">
-            <p>注册链接：<a href="https://cloud.siliconflow.cn/i/x77lxErl" target="_blank" rel="noreferrer">https://cloud.siliconflow.cn/i/x77lxErl</a></p>
-            <ol>
-              <li>注册或登录 SiliconFlow。</li>
-              <li>领取免费可用额度。</li>
-              <li>创建 API Key。</li>
-              <li>粘贴到这里并保存，验证通过后会自动启用。</li>
-            </ol>
+            {usesWebLlm ? (
+              <>
+                <p>文档：<a href="https://webllm.mlc.ai/docs/" target="_blank" rel="noreferrer">https://webllm.mlc.ai/docs/</a></p>
+                <ol>
+                  <li>选择 WebLLM 后，题目生成、批改、追问和表达卡会在当前浏览器内运行。</li>
+                  <li>首次验证或首次训练会下载量化模型权重，并缓存到浏览器 Cache Storage；大陆网络可把模型下载镜像设为 https://hf-mirror.com。</li>
+                  <li>下载中断后重新加载同一模型，WebLLM 会复用浏览器已缓存的资源。</li>
+                  <li>需要支持 WebGPU 的浏览器，例如 Chrome 或 Edge 113+。</li>
+                </ol>
+              </>
+            ) : (
+              <>
+                <p>注册链接：<a href="https://cloud.siliconflow.cn/i/x77lxErl" target="_blank" rel="noreferrer">https://cloud.siliconflow.cn/i/x77lxErl</a></p>
+                <ol>
+                  <li>注册或登录 SiliconFlow。</li>
+                  <li>领取免费可用额度。</li>
+                  <li>创建 API Key。</li>
+                  <li>粘贴到这里并保存，验证通过后会自动启用。</li>
+                </ol>
+              </>
+            )}
           </div>
         )}
       </div>

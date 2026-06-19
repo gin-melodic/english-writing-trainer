@@ -1,4 +1,6 @@
-import { DIMENSIONS, Dimension, DimensionScore, DrillCard, FollowUpMessage, GradeResult, Question, Settings, StudyGuide } from "./types";
+import { DIMENSIONS, Dimension, DimensionScore, DrillCard, FollowUpMessage, GradeResult, Question, ReportFacts, Settings, StudyGuide } from "./types";
+import { normalizeErrorTags } from "./errorTags";
+import { calibrateGeneratedQuestion } from "./questionCalibration";
 import { publicQuestionSkills } from "./questionSafety";
 import { enqueue } from "./llmQueue";
 
@@ -45,29 +47,7 @@ function isMeaningfulText(value: unknown) {
   return text.length >= 8 && !/^[.\s。…-]+$/.test(text);
 }
 
-type AssessmentNarrativePayload = {
-  totalQuestions: number;
-  matrix: Array<{ dimension: Dimension; score: number; confidence: number; evidence_count: number }>;
-  findings: string[];
-  evidence_details?: Array<{
-    question_index: number;
-    dimension: Dimension;
-    secondary_dimensions: Dimension[];
-    difficulty: number;
-    grammar_focus: string;
-    skills: string[];
-    rubric_points: string[];
-    chinese: string;
-    user_answer: string;
-    reference_answer: string;
-    verdict: GradeResult["verdict"];
-    error_types: string[];
-    dimension_scores: DimensionScore[];
-    differences: string[];
-    explanations: string[];
-    skill_findings: string[];
-  }>;
-};
+type AssessmentNarrativePayload = ReportFacts;
 
 type StudyGuideQuestionOutline = {
   dimension: Dimension;
@@ -83,14 +63,16 @@ function fallbackAssessmentNarrative(payload: AssessmentNarrativePayload) {
   const weak = sorted.filter((item) => item.score < 70 || item.evidence_count < 3);
   const strongest = [...payload.matrix].sort((a, b) => b.score - a.score)[0];
   const weakest = weak[0] ?? sorted[0];
-  const missing = payload.matrix.filter((item) => item.evidence_count === 0).map((item) => item.dimension);
-  const evidence = payload.findings
-    .map((item) => item.replaceAll("_", " ").trim())
+  const missing = payload.insufficient_evidence_dimensions.length
+    ? payload.insufficient_evidence_dimensions
+    : payload.matrix.filter((item) => item.evidence_count === 0).map((item) => item.dimension);
+  const evidence = payload.top_skill_findings
+    .map((item) => `${item.skill} ${item.count} 次`)
     .filter(Boolean)
     .slice(0, 3);
 
   const summaryParts = [
-    `本次测评共完成 ${payload.totalQuestions} 题，当前最需要优先处理的是${weakest.dimension}，测评分为 ${weakest.score}。`,
+    `本次测评共完成 ${payload.total_questions} 题，当前最需要优先处理的是${weakest.dimension}，测评分为 ${weakest.score}。`,
     strongest ? `${strongest.dimension}相对稳定，测评分为 ${strongest.score}。` : "",
     missing.length ? `${missing.join("、")}暂时缺少有效测评证据，后续需要补题确认。` : "系统已根据逐题表现生成当前能力矩阵。"
   ].filter(Boolean);
@@ -222,6 +204,16 @@ export type AssessmentNarrativeStreamProgress = {
   deltaReasoning?: string;
 };
 
+export type TextStreamProgress = {
+  content: string;
+  generatedChars: number;
+  estimatedTokens: number;
+  tokensPerSecond: number;
+  finalTokens?: number;
+  deltaContent?: string;
+  deltaReasoning?: string;
+};
+
 function chatEndpoint(settings: RuntimeSettings) {
   const baseUrl = isPersonalProvider(settings) ? settings.personalBaseUrl : settings.baseUrl;
   return `${baseUrl.replace(/\/$/, "")}/chat/completions`;
@@ -238,11 +230,24 @@ function isPersonalProvider(settings: RuntimeSettings) {
   return Boolean(settings.personalProviderEnabled && settings.personalApiKey);
 }
 
+function isZaiProvider(settings: RuntimeSettings) {
+  return !isPersonalProvider(settings);
+}
+
+function providerLabel(settings: RuntimeSettings) {
+  if (settings.llmProvider === "webllm") return "WebLLM";
+  if (isPersonalProvider(settings)) return "OpenAI 兼容模型";
+  return "GLM";
+}
+
 function ensureChatSettings(settings: RuntimeSettings) {
+  if (settings.llmProvider === "webllm") {
+    throw new Error("WebLLM 只能在浏览器中运行，请在前端使用浏览器内推理");
+  }
   if (isPersonalProvider(settings)) {
-    if (!settings.personalBaseUrl) throw new Error("请先填写 SiliconFlow API 地址");
-    if (!settings.personalModel) throw new Error("请先填写 SiliconFlow 模型名称");
-    if (!settings.personalApiKey) throw new Error("请先保存 SiliconFlow API Key");
+    if (!settings.personalBaseUrl) throw new Error(`请先填写 ${providerLabel(settings)} API 地址`);
+    if (!settings.personalModel) throw new Error(`请先填写 ${providerLabel(settings)} 模型名称`);
+    if (!settings.personalApiKey) throw new Error("请先保存个人模型 API Key");
     return;
   }
   if (!getZaiApiKey()) throw new Error("请先在 .env 中填写 ZAI_API_KEY");
@@ -259,7 +264,7 @@ function glmRequestTimeoutMs() {
 }
 
 function llmQueueConcurrency(settings: RuntimeSettings) {
-  if (!isPersonalProvider(settings)) return 1;
+  if (isZaiProvider(settings)) return 1;
   const parsed = Number(settings.maxConcurrentPredictions);
   return Number.isFinite(parsed) ? Math.max(1, Math.min(20, Math.round(parsed))) : 20;
 }
@@ -270,20 +275,23 @@ function providerPayload(settings: RuntimeSettings, payload: ChatPayload): ChatP
     ...payload,
     model
   };
-  if (isPersonalProvider(settings)) {
+  if (!isZaiProvider(settings)) {
     delete next.thinking;
   }
   return next;
 }
 
 async function fetchChat(settings: RuntimeSettings, payload: ChatPayload) {
-  const apiKey = isPersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
+  const apiKey = settings.llmProvider === "webllm"
+    ? ""
+    : isPersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json"
+  };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   const response = await fetch(chatEndpoint(settings), {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
+    headers,
     signal: AbortSignal.timeout(glmRequestTimeoutMs()),
     body: JSON.stringify(payload)
   });
@@ -549,20 +557,23 @@ function assessmentNarrativeMessages(payload: AssessmentNarrativePayload): ChatM
     {
       role: "system",
       content: `你是一位严谨的中译英写作能力测评老师。请只输出符合 schema 的 JSON，不要输出 markdown。
-报告必须具体、可执行，并且基于输入证据判断；不要写泛泛的鼓励、空话或与证据无关的结论。`
+报告必须具体、可执行，并且只能基于输入的本地计算事实写作；不要重新判断能力分，不要编造逐题细节。`
     },
     {
       role: "user",
-      content: `请根据以下结构化测评结果，生成中文总结报告。
-题量：${payload.totalQuestions}
+      content: `请根据以下 ReportFacts，生成中文总结报告。LLM 只能解释这些已计算事实，不要重新判断分数或补充不存在的逐题证据。
+ReportFacts：${JSON.stringify(payload)}
+题量：${payload.total_questions}
 能力矩阵：${JSON.stringify(payload.matrix)}
 低分优先矩阵：${JSON.stringify(sortedMatrix)}
-逐题结构化证据：${JSON.stringify((payload.evidence_details ?? []).slice(0, 20))}
-典型证据：${JSON.stringify(payload.findings.slice(0, 30))}
+最弱维度：${JSON.stringify(payload.weakest_dimensions)}
+证据不足维度：${JSON.stringify(payload.insufficient_evidence_dimensions)}
+高频规范错误标签：${JSON.stringify(payload.top_error_tags)}
+高频技能发现：${JSON.stringify(payload.top_skill_findings)}
 
 要求：
 1. summary 用 2-4 句话，必须说明整体水平、最弱 1-2 个维度、相对稳定维度，以及置信度/证据量是否足够；不要只说“需要加强”。
-2. weak_points 给 3-6 条最需要优先处理的薄弱点，按优先级排序。每条必须包含：维度名称、分数或证据量、具体错误表现、为什么影响中译英质量；优先引用逐题结构化证据中的用户译文、dimension_scores.notes、differences、explanations 或 skill_findings。
+2. weak_points 给 3-6 条最需要优先处理的薄弱点，按优先级排序。每条必须包含：维度名称、分数或证据量、具体错误标签或技能发现、为什么影响中译英质量。
 3. recommendations 给 3-6 条具体训练建议，必须和 weak_points 一一呼应。每条建议要包含训练动作、练习量或频率、检查标准，例如“连续 3 天每天 5 句”“每句先标主谓宾/时态/从句边界”。
 4. 对 evidence_count 为 0 或 confidence 低于 0.5 的维度，不要武断下结论；应写成“证据不足，需要补测确认”。
 5. 如果某个维度 score 低于 60，应明确列为优先薄弱点；60-75 写成不稳定；80 以上只在 summary 中作为相对优势提及。
@@ -771,7 +782,17 @@ async function readChatStream(
     if (!dataLines.length) return false;
     const dataText = dataLines.join("\n").trim();
     if (!dataText || dataText === "[DONE]") return dataText === "[DONE]";
-    const data = JSON.parse(dataText);
+    let data: unknown;
+    try {
+      data = JSON.parse(dataText);
+    } catch (error) {
+      console.error("LLM upstream SSE JSON parse failed", {
+        dataText,
+        rawEvent,
+        error
+      });
+      throw new Error(`上游 LLM 流式 JSON 解析失败：${error instanceof Error ? error.message : "未知解析错误"}`);
+    }
     const delta = extractStreamDelta(data);
     if (delta.content) content += delta.content;
     if (delta.reasoning) reasoning += delta.reasoning;
@@ -851,6 +872,62 @@ async function chatText(settings: Settings, messages: ChatMessage[]): Promise<st
   return content;
 }
 
+async function chatTextStream(settings: Settings, messages: ChatMessage[], onProgress?: (progress: TextStreamProgress) => void): Promise<string> {
+  ensureChatSettings(settings);
+  const startedAt = Date.now();
+  console.info("LLM text stream started", {
+    provider: providerLabel(settings as RuntimeSettings),
+    model: isPersonalProvider(settings as RuntimeSettings) ? settings.personalModel : settings.model,
+    messageCount: messages.length,
+    prompt: formatChatMessagesForLog(messages)
+  });
+  const payload: ChatPayload = {
+    model: settings.model,
+    temperature: settings.temperature,
+    messages,
+    thinking: { type: "disabled" },
+    stream: true
+  };
+  const res = await postChat(settings, payload);
+  console.info("LLM text stream response received", {
+    status: res.status,
+    ok: res.ok,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+  if (!res.ok) throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
+  const streamed = await readChatStream(res, (progress) => {
+    const content = stripThinking(progress.deltaContent || "");
+    if (content || progress.finalTokens !== undefined) {
+      console.info("LLM text stream delta", {
+        deltaChars: content.length,
+        generatedChars: progress.generatedChars,
+        estimatedTokens: progress.estimatedTokens,
+        tokensPerSecond: progress.tokensPerSecond,
+        finalTokens: progress.finalTokens,
+        delta: preview(content)
+      });
+    }
+    onProgress?.({
+      content,
+      generatedChars: progress.generatedChars,
+      estimatedTokens: progress.estimatedTokens,
+      tokensPerSecond: progress.tokensPerSecond,
+      finalTokens: progress.finalTokens,
+      deltaContent: content || undefined,
+      deltaReasoning: progress.deltaReasoning
+    });
+  });
+  const content = stripThinking(streamed.content).trim();
+  if (!content) throw new Error("AI 没有返回追问解答");
+  console.info("LLM text stream completed", {
+    contentChars: content.length,
+    finalTokens: streamed.finalTokens,
+    elapsedMs: elapsedMsSince(startedAt),
+    content: preview(content)
+  });
+  return content;
+}
+
 export async function testConnection(settings: Settings) {
   ensureChatSettings(settings);
   const tests: ConnectionTestItem[] = [];
@@ -893,14 +970,17 @@ export async function testConnection(settings: Settings) {
 
   await runTest("streaming", "流式结构化输出", async () => {
     const messages = withJsonSchemaInstruction(assessmentNarrativeMessages({
-      totalQuestions: 1,
+      total_questions: 1,
       matrix: DIMENSIONS.map((dimension, index) => ({
         dimension,
         score: index === 0 ? 55 : 80,
         confidence: index === 0 ? 0.4 : 0.8,
         evidence_count: 1
       })),
-      findings: ["第 1 题 时态 - 过去式不稳定"]
+      weakest_dimensions: [{ dimension: "时态", score: 55, confidence: 0.4, evidence_count: 1 }],
+      insufficient_evidence_dimensions: ["时态"],
+      top_error_tags: [{ tag: "tense_error", count: 1 }],
+      top_skill_findings: [{ skill: "过去式不稳定", count: 1 }]
     }), "assessment_narrative", assessmentNarrativeSchema);
     const response = await postChat(settings, {
       model: settings.model,
@@ -1058,7 +1138,7 @@ function normalizeGeneratedQuestion(
   includeVocabularyTips: boolean
 ): Question {
   const answers = toTextArray(parsed.answers, ["This question needs a valid reference answer."]).filter(Boolean);
-  return {
+  const question: Question = {
     chinese: toText(parsed.chinese, "题目生成失败，请重新生成。"),
     answers: [answers[0] || "This question needs a valid reference answer."],
     vocabulary_tips: includeVocabularyTips ? toVocabularyTips(parsed.vocabulary_tips) : undefined,
@@ -1069,6 +1149,13 @@ function normalizeGeneratedQuestion(
     rubric_points: toTextArray(parsed.rubric_points).slice(0, 6),
     difficulty,
     source: "ai"
+  };
+  const calibration = calibrateGeneratedQuestion(question, difficulty);
+  return {
+    ...question,
+    difficulty_b: calibration.difficulty_b,
+    calibration_issues: calibration.issues,
+    calibration_passed: calibration.passed
   };
 }
 
@@ -1165,9 +1252,11 @@ partial 只用于核心考点已经正确、但存在不影响目标结构的小
   ], "grade_result", gradeSchema(question.dimension));
   const dimensionScores = normalizeDimensionScores(parsed.dimension_scores, question.dimension);
   const verdict = ["correct", "partial", "wrong"].includes(parsed.verdict) ? parsed.verdict : "wrong";
+  const rawErrorTypes = toTextArray(parsed.error_types);
   return {
     verdict: normalizeGradeVerdict(verdict, dimensionScores, question.dimension),
-    error_types: toTextArray(parsed.error_types),
+    error_types: rawErrorTypes,
+    error_tags: normalizeErrorTags(rawErrorTypes),
     reference_answers: [toTextArray(parsed.reference_answers, question.answers)[0] || question.answers[0] || "No reference answer was provided."],
     differences: toTextArray(parsed.differences),
     explanations: toTextArray(parsed.explanations),
@@ -1227,6 +1316,58 @@ export async function answerQuestionFollowUp(
   return chatText(settings, chatMessages);
 }
 
+export async function answerQuestionFollowUpStream(
+  settings: Settings,
+  question: Question,
+  userAnswer: string,
+  result: GradeResult,
+  messages: FollowUpMessage[],
+  prompt: string,
+  onProgress?: (progress: TextStreamProgress) => void
+): Promise<string> {
+  const safeMessages = messages
+    .filter((message) => message.content.trim())
+    .slice(-8)
+    .map((message) => ({
+      role: message.role,
+      content: message.content.trim().slice(0, 1200)
+    }));
+  const chatMessages: ChatMessage[] = [
+    {
+      role: "system",
+      content: `你是一位耐心、严格的中译英写作教练，母语为中文。
+只围绕当前题目、用户译文、参考答案和批改结果回答追问。
+回答要简洁具体，必要时给出改写后的英文句子和原因；不要生成新题，不要改写能力报告。
+如果适合用列表、代码块或 JSON 展示，请输出标准 Markdown 或合法 JSON，前端会流式格式化。`
+    },
+    {
+      role: "user",
+      content: `当前题目上下文：
+中文原句：${question.chinese}
+考查维度：${question.dimension}
+次要维度：${question.secondary_dimensions?.join("、") || "无"}
+考查语法点：${question.grammar_focus}
+批改要点：${question.rubric_points?.join("；") || "按题目语法点批改"}
+最佳参考答案：${result.reference_answers[0] || question.answers[0] || "无"}
+用户译文：${userAnswer}
+批改结论：${result.verdict}
+错误类型：${result.error_types.join("、") || "无"}
+差异：${result.differences.join("；") || "无"}
+解释：${result.explanations.join("；") || "无"}
+记忆技巧：${result.memory_tip || "无"}`
+    },
+    ...safeMessages.map((message): ChatMessage => ({
+      role: message.role,
+      content: message.content
+    })),
+    {
+      role: "user",
+      content: prompt.trim().slice(0, 1200)
+    }
+  ];
+  return chatTextStream(settings, chatMessages, onProgress);
+}
+
 export async function generateStudyGuide(
   settings: Settings,
   outlines: StudyGuideQuestionOutline[]
@@ -1275,6 +1416,9 @@ export async function generateAssessmentNarrative(
   settings: Settings,
   payload: AssessmentNarrativePayload
 ) {
+  if (settings.llmProvider === "webllm") {
+    return fallbackAssessmentNarrative(payload);
+  }
   try {
     const parsed = await chat<{ summary?: string; weak_points?: string[]; recommendations?: string[] }>(
       settings,
@@ -1295,6 +1439,10 @@ export async function generateAssessmentNarrativeStream(
   payload: AssessmentNarrativePayload,
   onProgress?: (progress: AssessmentNarrativeStreamProgress) => void
 ): Promise<AssessmentNarrative> {
+  if (settings.llmProvider === "webllm") {
+    onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
+    return fallbackAssessmentNarrative(payload);
+  }
   ensureChatSettings(settings);
   const messages = withJsonSchemaInstruction(assessmentNarrativeMessages(payload), "assessment_narrative", assessmentNarrativeSchema);
   const startedAt = Date.now();
@@ -1303,8 +1451,9 @@ export async function generateAssessmentNarrativeStream(
   const logPrefix = "GLM assessment narrative stream";
   console.info(`${logPrefix} started`, {
     model: settings.model,
-    totalQuestions: payload.totalQuestions,
-    findings: payload.findings.length,
+    totalQuestions: payload.total_questions,
+    topErrorTags: payload.top_error_tags.length,
+    topSkillFindings: payload.top_skill_findings.length,
     prompt: formatChatMessagesForLog(messages)
   });
   const res = await postChat(settings, {

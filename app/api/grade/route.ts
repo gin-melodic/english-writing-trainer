@@ -4,22 +4,48 @@ import { addMistake, getAbilities, getRuntimeSettings, getSkillAbilities, initDb
 import { authErrorResponse, requireUser } from "@/lib/auth";
 import { gradeAnswer } from "@/lib/llm";
 import { publicQuestionSkills } from "@/lib/questionSafety";
-import { Question } from "@/lib/types";
+import { GradeResult, Question } from "@/lib/types";
+
+function normalizeClientGradeResult(value: unknown): GradeResult | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Partial<GradeResult>;
+  if (!["correct", "partial", "wrong"].includes(String(raw.verdict))) return undefined;
+  const toArray = (items: unknown) => Array.isArray(items) ? items.map((item) => String(item)).filter(Boolean) : [];
+  return {
+    verdict: raw.verdict as GradeResult["verdict"],
+    error_types: toArray(raw.error_types),
+    error_tags: Array.isArray(raw.error_tags) ? raw.error_tags : undefined,
+    reference_answers: toArray(raw.reference_answers),
+    differences: toArray(raw.differences),
+    explanations: toArray(raw.explanations),
+    memory_tip: typeof raw.memory_tip === "string" ? raw.memory_tip : undefined,
+    dimension_scores: Array.isArray(raw.dimension_scores) ? raw.dimension_scores : undefined,
+    skill_findings: toArray(raw.skill_findings)
+  };
+}
 
 export async function POST(request: Request) {
   try {
     initDb();
     const user = requireUser(request);
-    const { question, answer, sessionId, mode, questionIndex, durationSeconds } = (await request.json()) as {
+    const body = await request.json() as {
       question: Question;
       answer: string;
+      result?: unknown;
       sessionId?: number;
       mode?: string;
       questionIndex?: number;
       durationSeconds?: number;
     };
+    const { question, answer, sessionId, mode, questionIndex, durationSeconds } = body;
     const safeQuestion: Question = { ...question, skills: publicQuestionSkills(question.skills) };
-    const result = await gradeAnswer(getRuntimeSettings(user.id), safeQuestion, answer);
+    const settings = getRuntimeSettings(user.id);
+    const clientResult = normalizeClientGradeResult(body.result);
+    if (settings.llmProvider === "webllm" && !clientResult) {
+      return NextResponse.json({ message: "WebLLM 模式需要提交浏览器端批改结果" }, { status: 400 });
+    }
+    const result = clientResult ?? await gradeAnswer(settings, safeQuestion, answer);
+    if (!result.reference_answers.length) result.reference_answers = safeQuestion.answers;
     const correct = result.verdict === "correct";
     const normalizedMode = String(mode || "每日练习");
 

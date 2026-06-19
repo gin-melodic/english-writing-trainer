@@ -557,6 +557,10 @@ select:focus {
 .followup-thread {
   display: grid;
   gap: 10px;
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
+  scroll-behavior: smooth;
 }
 
 .followup-message {
@@ -578,6 +582,112 @@ select:focus {
 
 .followup-message.assistant p {
   border-left-color: var(--accent);
+}
+
+.followup-message.assistant > .formatted-markdown,
+.followup-message.assistant > .formatted-code,
+.followup-message.assistant > .stream-placeholder {
+  border-left: 3px solid var(--accent);
+  margin: 0;
+  padding-left: 10px;
+}
+
+.formatted-markdown {
+  display: grid;
+  gap: 8px;
+}
+
+.formatted-markdown p,
+.formatted-markdown ul,
+.formatted-markdown ol,
+.formatted-markdown h3,
+.formatted-markdown h4 {
+  margin: 0;
+}
+
+.formatted-markdown ul,
+.formatted-markdown ol {
+  padding-left: 22px;
+}
+
+.formatted-markdown li + li {
+  margin-top: 4px;
+}
+
+.formatted-markdown h3,
+.formatted-markdown h4 {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.formatted-markdown code,
+.formatted-code code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.formatted-markdown code {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #101316;
+  padding: 1px 5px;
+  color: var(--yellow);
+  font-size: 0.92em;
+}
+
+.formatted-code {
+  overflow: auto;
+  max-width: 100%;
+  border-radius: 8px;
+  background: #101316;
+  color: #e9edf1;
+  padding: 10px 12px;
+  white-space: pre;
+}
+
+.formatted-code.json {
+  border: 1px solid rgba(231, 198, 106, 0.28);
+}
+
+.stream-placeholder {
+  color: var(--muted);
+}
+
+.stream-log-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(16, 19, 22, 0.72);
+  display: grid;
+  gap: 8px;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.stream-log-panel strong {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.stream-log-panel p {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.stream-log-panel p + p {
+  margin-top: 4px;
+}
+
+.stream-log-panel p.error {
+  color: #ff9f9f;
+}
+
+.stream-log-panel span {
+  color: var(--yellow);
+  margin-right: 8px;
 }
 
 .followup-input {
@@ -1164,6 +1274,42 @@ button.skill-pill {
   background: var(--panel);
   padding: 20px;
   box-shadow: 0 20px 80px rgba(0, 0, 0, 0.45);
+}
+
+.webllm-progress-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 92px;
+  z-index: 40;
+  display: grid;
+  gap: 14px;
+  width: min(560px, calc(100vw - 40px));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 16px;
+  box-shadow: 0 16px 54px rgba(0, 0, 0, 0.38);
+}
+
+.webllm-progress-toast p {
+  margin: 0;
+}
+
+.webllm-progress-bar {
+  height: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #0f1113;
+}
+
+.webllm-progress-bar span {
+  display: block;
+  height: 100%;
+  min-width: 10%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--green));
+  transition: width 0.24s ease;
 }
 
 .capture-fab {

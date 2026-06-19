@@ -12,6 +12,8 @@ const DEFAULT_GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
 const DEFAULT_GLM_MODEL = "glm-4.7-flash";
 const DEFAULT_PERSONAL_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_PERSONAL_MODEL = "deepseek-ai/DeepSeek-V4-Flash";
+const DEFAULT_WEBLLM_MODEL_BASE_URL = "https://hf-mirror.com";
+const DEFAULT_LLM_PROVIDER: Settings["llmProvider"] = "zai";
 const FREE_MODEL_CONCURRENCY = 1;
 const DEFAULT_PERSONAL_CONCURRENCY = 20;
 const MAX_PERSONAL_CONCURRENCY = 20;
@@ -517,6 +519,7 @@ export function resetUserPassword(id: number, password: string) {
 
 export function getSettings(userId = DEFAULT_USER_ID): Settings {
   const defaults: Settings = {
+    llmProvider: DEFAULT_LLM_PROVIDER,
     baseUrl: DEFAULT_GLM_BASE_URL,
     model: DEFAULT_GLM_MODEL,
     temperature: 0.3,
@@ -525,6 +528,7 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,
+    webLlmModelBaseUrl: DEFAULT_WEBLLM_MODEL_BASE_URL,
     hasPersonalApiKey: false
   };
   const data = rows<{ key: string; value: string }>("SELECT key, value FROM settings;");
@@ -545,11 +549,18 @@ SELECT key, value FROM user_settings WHERE user_id = ${Number(userId)};
 `);
   for (const item of userRows) {
     if (item.key === "dailyCount") defaults.dailyCount = Number(item.value);
+    if (item.key === "llmProvider" && ["zai", "openai-compatible", "webllm"].includes(item.value)) {
+      defaults.llmProvider = item.value as Settings["llmProvider"];
+    }
     if (item.key === "personalBaseUrl") defaults.personalBaseUrl = item.value || DEFAULT_PERSONAL_BASE_URL;
     if (item.key === "personalModel") defaults.personalModel = item.value || DEFAULT_PERSONAL_MODEL;
+    if (item.key === "webLlmModelBaseUrl") defaults.webLlmModelBaseUrl = item.value || DEFAULT_WEBLLM_MODEL_BASE_URL;
     if (item.key === "personalApiKeyEncrypted") defaults.hasPersonalApiKey = Boolean(item.value);
   }
-  defaults.personalProviderEnabled = defaults.hasPersonalApiKey;
+  if (defaults.hasPersonalApiKey && defaults.llmProvider === "zai") {
+    defaults.llmProvider = "openai-compatible";
+  }
+  defaults.personalProviderEnabled = defaults.llmProvider !== "zai" && (defaults.hasPersonalApiKey || defaults.llmProvider === "webllm");
   if (defaults.personalProviderEnabled) {
     defaults.maxConcurrentPredictions = defaults.maxConcurrentPredictions > FREE_MODEL_CONCURRENCY
       ? normalizeLlmConcurrency(defaults.maxConcurrentPredictions, DEFAULT_PERSONAL_CONCURRENCY)
@@ -584,7 +595,11 @@ export function getRuntimeSettings(userId = DEFAULT_USER_ID): RuntimeSettings {
 
 export function setSettings(settings: Settings & { personalApiKey?: string; clearPersonalApiKey?: boolean }, actorRole: UserRole = "user", userId = DEFAULT_USER_ID) {
   const current = getSettings(userId);
+  const requestedProvider = ["zai", "openai-compatible", "webllm"].includes(String(settings.llmProvider))
+    ? settings.llmProvider
+    : current.llmProvider;
   const normalized: Settings = {
+    llmProvider: requestedProvider,
     baseUrl: actorRole === "admin" ? settings.baseUrl || DEFAULT_GLM_BASE_URL : current.baseUrl,
     model: actorRole === "admin" ? settings.model || DEFAULT_GLM_MODEL : current.model,
     temperature: actorRole === "admin" ? Math.min(1, Math.max(0, Number(settings.temperature) || 0.3)) : current.temperature,
@@ -592,9 +607,10 @@ export function setSettings(settings: Settings & { personalApiKey?: string; clea
     maxConcurrentPredictions: actorRole === "admin"
       ? normalizeLlmConcurrency(settings.maxConcurrentPredictions, current.maxConcurrentPredictions)
       : current.maxConcurrentPredictions,
-    personalProviderEnabled: current.hasPersonalApiKey || Boolean(settings.personalApiKey?.trim()),
+    personalProviderEnabled: requestedProvider !== "zai" && (requestedProvider === "webllm" || current.hasPersonalApiKey || Boolean(settings.personalApiKey?.trim())),
     personalBaseUrl: String(settings.personalBaseUrl || DEFAULT_PERSONAL_BASE_URL).trim() || DEFAULT_PERSONAL_BASE_URL,
     personalModel: String(settings.personalModel || DEFAULT_PERSONAL_MODEL).trim() || DEFAULT_PERSONAL_MODEL,
+    webLlmModelBaseUrl: String(settings.webLlmModelBaseUrl || DEFAULT_WEBLLM_MODEL_BASE_URL).trim().replace(/\/+$/, "") || DEFAULT_WEBLLM_MODEL_BASE_URL,
     hasPersonalApiKey: current.hasPersonalApiKey
   };
   if (actorRole === "admin") {
@@ -613,16 +629,18 @@ INSERT OR REPLACE INTO user_settings(user_id, key, value)
 VALUES (${Number(userId)}, 'dailyCount', ${sqlQuote(normalized.dailyCount)});
 `);
   const userEntries = [
+    ["llmProvider", normalized.llmProvider],
     ["personalProviderEnabled", normalized.personalProviderEnabled ? "true" : "false"],
     ["personalBaseUrl", normalized.personalBaseUrl],
-    ["personalModel", normalized.personalModel]
+    ["personalModel", normalized.personalModel],
+    ["webLlmModelBaseUrl", normalized.webLlmModelBaseUrl]
   ]
     .map(([key, value]) => `(${Number(userId)}, ${sqlQuote(key)}, ${sqlQuote(value)})`)
     .join(",");
   runSql(`INSERT OR REPLACE INTO user_settings(user_id, key, value) VALUES ${userEntries};`);
   if (settings.clearPersonalApiKey) {
     runSql(`DELETE FROM user_settings WHERE user_id = ${Number(userId)} AND key = 'personalApiKeyEncrypted';`);
-    normalized.personalProviderEnabled = false;
+    normalized.personalProviderEnabled = normalized.llmProvider === "webllm";
   }
   if (typeof settings.personalApiKey === "string" && settings.personalApiKey.trim()) {
     runSql(`
@@ -630,6 +648,9 @@ INSERT OR REPLACE INTO user_settings(user_id, key, value)
 VALUES (${Number(userId)}, 'personalApiKeyEncrypted', ${sqlQuote(encryptUserApiKey(settings.personalApiKey.trim()))});
 `);
     normalized.personalProviderEnabled = true;
+  }
+  if (normalized.llmProvider === "zai") {
+    normalized.personalProviderEnabled = false;
   }
   runSql(`
 INSERT OR REPLACE INTO user_settings(user_id, key, value)
@@ -723,6 +744,7 @@ DELETE FROM assessment_reports WHERE user_id = ${Number(userId)};
 DELETE FROM user_settings WHERE user_id = ${Number(userId)};
 `);
   setSettings({
+    llmProvider: DEFAULT_LLM_PROVIDER,
     baseUrl: DEFAULT_GLM_BASE_URL,
     model: DEFAULT_GLM_MODEL,
     temperature: 0.3,
@@ -731,6 +753,7 @@ DELETE FROM user_settings WHERE user_id = ${Number(userId)};
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,
+    webLlmModelBaseUrl: DEFAULT_WEBLLM_MODEL_BASE_URL,
     hasPersonalApiKey: false
   }, "admin", userId);
 }

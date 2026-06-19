@@ -2,7 +2,23 @@ export const DIMENSIONS = ["时态", "介词搭配", "定语从句", "连接词"
 
 export type Dimension = (typeof DIMENSIONS)[number];
 
+export type ErrorTag =
+  | "tense_error"
+  | "missing_article"
+  | "wrong_article"
+  | "preposition_error"
+  | "clause_word_order"
+  | "subject_verb_agreement"
+  | "passive_voice_error"
+  | "relative_clause_error"
+  | "conjunction_error"
+  | "word_choice"
+  | "omission"
+  | "spelling_or_punctuation"
+  | "other";
+
 export type Settings = {
+  llmProvider: "zai" | "openai-compatible" | "webllm";
   baseUrl: string;
   model: string;
   temperature: number;
@@ -11,6 +27,7 @@ export type Settings = {
   personalProviderEnabled: boolean;
   personalBaseUrl: string;
   personalModel: string;
+  webLlmModelBaseUrl: string;
   hasPersonalApiKey: boolean;
 };
 
@@ -39,6 +56,9 @@ export type Question = {
   skills?: string[];
   rubric_points?: string[];
   difficulty: number;
+  difficulty_b?: number;
+  calibration_issues?: string[];
+  calibration_passed?: boolean;
   source?: "ai" | "mistake";
   origin?: "ai" | "mistake" | "user_capture";
   mistakeId?: number;
@@ -98,6 +118,7 @@ export type DimensionScore = {
 export type GradeResult = {
   verdict: "correct" | "partial" | "wrong";
   error_types: string[];
+  error_tags?: ErrorTag[];
   reference_answers: string[];
   differences: string[];
   explanations: string[];
@@ -198,4 +219,24 @@ export type AssessmentReport = {
   weak_points: string[];
   recommendations: string[];
   created_at: string;
+};
+
+export type ReportFacts = {
+  total_questions: number;
+  matrix: AssessmentMatrixItem[];
+  weakest_dimensions: Array<{
+    dimension: Dimension;
+    score: number;
+    confidence: number;
+    evidence_count: number;
+  }>;
+  insufficient_evidence_dimensions: Dimension[];
+  top_error_tags: Array<{
+    tag: ErrorTag;
+    count: number;
+  }>;
+  top_skill_findings: Array<{
+    skill: string;
+    count: number;
+  }>;
 };
