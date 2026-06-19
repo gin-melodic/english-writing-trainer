@@ -158,6 +158,7 @@ const emptyState: AppState = {
     personalProviderEnabled: false,
     personalBaseUrl: "https://api.siliconflow.cn/v1",
     personalModel: "deepseek-ai/DeepSeek-V4-Flash",
+    personalResponseFormat: "auto",
     webLlmModelBaseUrl: "https://hf-mirror.com",
     hasPersonalApiKey: false
   },
@@ -2560,6 +2561,7 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onW
 }) {
   const [message, setMessage] = useState("");
   const [testResult, setTestResult] = useState<{ target: SettingsTestTarget; result: ConnectionTestResult } | null>(null);
+  const [saving, setSaving] = useState(false);
   const [showPersonalGuide, setShowPersonalGuide] = useState(false);
   const usesWebLlm = draft.llmProvider === "webllm";
   const usesPersonalModel = draft.llmProvider === "openai-compatible" || usesWebLlm;
@@ -2578,6 +2580,8 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onW
     </div>
   );
   async function save() {
+    if (saving) return;
+    setSaving(true);
     setTestResult(null);
     const personalKeyChanged = !usesWebLlm && Boolean(draft.personalApiKey?.trim());
     setMessage(personalKeyChanged ? "正在验证个人 API Key…" : "正在保存设置…");
@@ -2588,6 +2592,8 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onW
       await refresh();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "保存设置失败");
+    } finally {
+      setSaving(false);
     }
   }
   async function test(target: SettingsTestTarget) {
@@ -2672,6 +2678,12 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onW
           </select></label>
           {!usesWebLlm && <label>OpenAI 兼容 API 地址<input value={draft.personalBaseUrl} onChange={(e) => setDraft({ ...draft, personalBaseUrl: e.target.value })} placeholder="https://api.siliconflow.cn/v1" /></label>}
           <label>{usesWebLlm ? "WebLLM 模型 ID" : "模型名称"}<input value={draft.personalModel} onChange={(e) => setDraft({ ...draft, personalModel: e.target.value })} placeholder={usesWebLlm ? "Llama-3.2-3B-Instruct-q4f32_1-MLC" : "deepseek-ai/DeepSeek-V4-Flash"} /><span className="field-hint">{usesWebLlm ? "首次使用会下载并缓存模型权重；模型 ID 必须是 WebLLM 支持的 MLC 模型。" : "填写服务商提供的 chat completions 模型名称。"}</span></label>
+          {!usesWebLlm && <label>JSON 响应格式<select value={draft.personalResponseFormat} onChange={(e) => setDraft({ ...draft, personalResponseFormat: e.target.value as Settings["personalResponseFormat"] })}>
+            <option value="auto">自动（推荐）</option>
+            <option value="json_schema">json_schema（LM Studio 等）</option>
+            <option value="json_object">json_object（OpenAI 原生）</option>
+            <option value="none">不使用（纯 prompt 指令）</option>
+          </select><span className="field-hint">不同服务商对 response_format.type 支持不同。LM Studio 等本地模型通常不支持 json_object，需要选 json_schema 或自动模式。自动模式下若请求失败会回退到 prompt 指令。</span></label>}
           {usesWebLlm && <label>WebLLM 模型下载镜像<input value={draft.webLlmModelBaseUrl} onChange={(e) => setDraft({ ...draft, webLlmModelBaseUrl: e.target.value })} placeholder="https://hf-mirror.com" /><span className="field-hint">用于替换 WebLLM 模型权重的 huggingface.co 下载源；大陆网络建议使用 https://hf-mirror.com。</span></label>}
           {!usesWebLlm && <label>
             API Key
@@ -2717,7 +2729,7 @@ function SettingsPanel({ draft, setDraft, refresh, setError, error, isAdmin, onW
         )}
       </div>
       <div className="actions" style={{ justifyContent: "flex-start" }}>
-        <button className="primary" onClick={save}>保存设置</button>
+        <button className="primary" onClick={save} disabled={saving}>{saving ? "保存中..." : "保存设置"}</button>
         {isAdmin && <button onClick={() => test("global")}>测试免费模型</button>}
         <button onClick={() => reset("assessment")}>重置能力评估</button>
         <button className="danger" onClick={() => reset("all")}>清除所有数据</button>

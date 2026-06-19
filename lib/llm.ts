@@ -162,9 +162,10 @@ type JsonSchema = {
 type ChatPayload = {
   model: string;
   temperature: number;
-  response_format?: {
-    type: "json_object";
-  };
+  response_format?:
+  | { type: "json_object" }
+  | { type: "json_schema"; json_schema: { name: string; schema: Record<string, unknown> } }
+  ;
   messages: ChatMessage[];
   thinking?: {
     type: "enabled" | "disabled";
@@ -278,27 +279,66 @@ function providerPayload(settings: RuntimeSettings, payload: ChatPayload): ChatP
   if (!isZaiProvider(settings)) {
     delete next.thinking;
   }
+  console.info(`[${providerLabel(settings)}] providerPayload built`, {
+    model,
+    isPersonal: isPersonalProvider(settings),
+    hasThinking: "thinking" in next,
+    temperature: next.temperature,
+    hasResponseFormat: !!next.response_format,
+    messageCount: next.messages.length,
+    stream: Boolean(next.stream)
+  });
   return next;
 }
 
 async function fetchChat(settings: RuntimeSettings, payload: ChatPayload) {
+  const provider = providerLabel(settings);
+  const endpointUrl = chatEndpoint(settings);
   const apiKey = settings.llmProvider === "webllm"
     ? ""
     : isPersonalProvider(settings) ? settings.personalApiKey : getZaiApiKey();
+
+  console.info(`[${provider}] fetchChat sending request`, {
+    endpoint: endpointUrl,
+    model: payload.model,
+    apiKeyPresent: !!apiKey,
+    timeoutMs: glmRequestTimeoutMs(),
+    bodyBytes: JSON.stringify(payload).length,
+    stream: Boolean(payload.stream)
+  });
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json"
   };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const response = await fetch(chatEndpoint(settings), {
+
+  const fetchStartedAt = Date.now();
+  console.info(`[${provider}] fetchChat calling fetch()`, { endpoint: endpointUrl });
+
+  const response = await fetch(endpointUrl, {
     method: "POST",
     headers,
     signal: AbortSignal.timeout(glmRequestTimeoutMs()),
     body: JSON.stringify(payload)
   });
+
+  console.info(`[${provider}] fetchChat fetch() returned`, {
+    status: response.status,
+    ok: response.ok,
+    contentType: response.headers.get("content-type"),
+    contentLength: response.headers.get("content-length"),
+    elapsedMs: Date.now() - fetchStartedAt
+  });
+
   if (response.status !== 429) return response;
   const errorText = await response.text();
   const retryAfter = Number(response.headers.get("retry-after"));
-  throw Object.assign(new Error(`GLM 请求限流：${errorText}`), {
+  console.warn(`[${provider}] fetchChat rate limited`, {
+    status: response.status,
+    retryAfterMs: retryAfter * 1000,
+    elapsedMs: Date.now() - fetchStartedAt
+  });
+  throw Object.assign(new Error(`${provider} 请求限流：${errorText}`), {
     retryable: true,
     status: response.status,
     errorText,
@@ -307,23 +347,52 @@ async function fetchChat(settings: RuntimeSettings, payload: ChatPayload) {
 }
 
 async function postChat(settings: RuntimeSettings, payload: ChatPayload) {
+  const provider = providerLabel(settings);
+  const concurrency = llmQueueConcurrency(settings);
+
+  console.info(`[${provider}] postChat entering with concurrency=${concurrency}`, {
+    userId: settings.userId,
+    model: payload.model,
+    stream: Boolean(payload.stream)
+  });
+
   const run = async () => {
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      console.info(`[${provider}] postChat attempt ${attempt + 1}/3`, { model: payload.model });
       try {
-        return await fetchChat(settings, providerPayload(settings, payload));
+        const finalPayload = providerPayload(settings, payload);
+        return await fetchChat(settings, finalPayload);
       } catch (error) {
         lastError = error;
         const retryable = Boolean((error as { retryable?: boolean })?.retryable)
           || (error instanceof Error && /Timeout|UND_ERR_HEADERS_TIMEOUT|fetch failed/i.test(error.message));
+
+        console.warn(`[${provider}] postChat attempt ${attempt + 1} failed`, {
+          retryable,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          hasRetryAfterMs: !!(error as { retryAfterMs?: number })?.retryAfterMs
+        });
+
         if (!retryable || attempt === 2) throw error;
-        const retryAfterMs = (error as { retryAfterMs?: number })?.retryAfterMs;
-        await delay(retryAfterMs ?? 20000 * (attempt + 1));
+        const retryAfterMs = (error as { retryAfterMs?: number })?.retryAfterMs ?? 20000 * (attempt + 1);
+        console.info(`[${provider}] postChat waiting ${retryAfterMs}ms before retry`, {});
+        await delay(retryAfterMs);
       }
     }
     throw lastError;
   };
-  return enqueue(run, settings.userId, llmQueueConcurrency(settings));
+
+  const enqueueStart = Date.now();
+  console.info(`[${provider}] postChat enqueuing task to llmQueue`);
+
+  const result = await enqueue(run, settings.userId, concurrency);
+
+  console.info(`[${provider}] postChat dequeue and execute completed`, {
+    elapsedMs: Date.now() - enqueueStart
+  });
+
+  return result;
 }
 
 function contentBlockToText(value: unknown) {
@@ -362,8 +431,31 @@ function extractStreamDelta(data: unknown) {
   };
 }
 
-function jsonResponseFormat(): ChatPayload["response_format"] {
-  return { type: "json_object" };
+function jsonResponseFormat(
+  settings?: RuntimeSettings,
+  schemaName?: string,
+  schema?: JsonSchema
+): ChatPayload["response_format"] {
+  // Zai/GLM always uses json_schema format
+  if (settings && isZaiProvider(settings) && schema && schemaName) {
+    return { type: "json_schema", json_schema: { name: schemaName, schema } };
+  }
+
+  // Personal providers use the user-configured response_format mode
+  if (!settings || !isPersonalProvider(settings)) {
+    return { type: "json_object" };
+  }
+
+  const fmt = settings.personalResponseFormat;
+  if (fmt === "json_schema" && schema && schemaName) {
+    return { type: "json_schema", json_schema: { name: schemaName, schema } };
+  }
+  // "auto", "none": omit response_format, rely on prompt instructions
+  // "json_object": use OpenAI-style json_object (but only if explicitly set below)
+  if (fmt === "json_object") {
+    return { type: "json_object" };
+  }
+  return undefined;
 }
 
 function withJsonSchemaInstruction(messages: ChatMessage[], schemaName: string, schema: JsonSchema) {
@@ -765,7 +857,7 @@ async function readChatStream(
   res: Response,
   onProgress?: (progress: AssessmentNarrativeStreamProgress) => void
 ) {
-  if (!res.body) throw new Error("GLM 流式响应为空");
+  if (!res.body) throw new Error("模型流式响应为空");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const startedAt = Date.now();
@@ -773,26 +865,46 @@ async function readChatStream(
   let content = "";
   let reasoning = "";
   let finalTokens: number | undefined;
+  let chunkCount = 0;
+  let totalBytes = 0;
+  let eventCount = 0;
+
+  console.info("[readChatStream] Start reading stream");
 
   async function handleEvent(rawEvent: string) {
+    eventCount += 1;
     const dataLines = rawEvent
       .split(/\r?\n/)
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trimStart());
-    if (!dataLines.length) return false;
+    if (!dataLines.length) {
+      if (rawEvent.trim()) {
+        console.warn(`[readChatStream] Event #${eventCount} does not start with 'data:':`, { rawEvent });
+      }
+      return false;
+    }
     const dataText = dataLines.join("\n").trim();
-    if (!dataText || dataText === "[DONE]") return dataText === "[DONE]";
+    if (!dataText || dataText === "[DONE]") {
+      console.info(`[readChatStream] Event #${eventCount} is empty or [DONE]`, { dataText });
+      return dataText === "[DONE]";
+    }
     let data: unknown;
     try {
       data = JSON.parse(dataText);
     } catch (error) {
-      console.error("LLM upstream SSE JSON parse failed", {
+      console.error("[readChatStream] LLM upstream SSE JSON parse failed", {
+        eventIndex: eventCount,
         dataText,
         rawEvent,
         error
       });
       throw new Error(`上游 LLM 流式 JSON 解析失败：${error instanceof Error ? error.message : "未知解析错误"}`);
     }
+
+    if (data && typeof data === "object" && "error" in data) {
+      console.error("[readChatStream] LLM upstream returned error payload inside stream", data);
+    }
+
     const delta = extractStreamDelta(data);
     if (delta.content) content += delta.content;
     if (delta.reasoning) reasoning += delta.reasoning;
@@ -815,72 +927,254 @@ async function readChatStream(
   while (true) {
     const { done, value } = await reader.read();
     if (value) {
+      chunkCount += 1;
+      totalBytes += value.length;
+      console.info(`[readChatStream] Received chunk #${chunkCount}, size: ${value.length} bytes, total: ${totalBytes} bytes`);
+
       buffer += decoder.decode(value, { stream: !done });
       const events = buffer.split(/\r?\n\r?\n/);
       buffer = events.pop() ?? "";
       for (const event of events) {
-        if (await handleEvent(event)) return { content, reasoning, finalTokens };
+        if (await handleEvent(event)) {
+          console.info("[readChatStream] Stream finished via [DONE] event", {
+            elapsedMs: Date.now() - startedAt,
+            chunkCount,
+            totalBytes,
+            eventCount,
+            contentLen: content.length,
+            reasoningLen: reasoning.length,
+            finalTokens
+          });
+          return { content, reasoning, finalTokens };
+        }
       }
     }
     if (done) break;
   }
-  if (buffer.trim()) await handleEvent(buffer);
+  if (buffer.trim()) {
+    console.info("[readChatStream] Processing remaining buffer after stream done");
+    await handleEvent(buffer);
+  }
+  console.info("[readChatStream] Stream finished", {
+    elapsedMs: Date.now() - startedAt,
+    chunkCount,
+    totalBytes,
+    eventCount,
+    contentLen: content.length,
+    reasoningLen: reasoning.length,
+    finalTokens
+  });
   return { content, reasoning, finalTokens };
 }
 
 async function chat<T>(settings: Settings, messages: ChatMessage[], schemaName: string, schema: JsonSchema, options: { thinking?: boolean } = {}): Promise<T> {
-  ensureChatSettings(settings);
+  const startedAt = Date.now();
+  const runtimeSettings = settings as RuntimeSettings;
+  const provider = providerLabel(runtimeSettings);
+  const model = isPersonalProvider(runtimeSettings) ? runtimeSettings.personalModel : settings.model;
+
+  console.info(`[${provider}] chat begin`, {
+    schemaName,
+    model,
+    temperature: settings.temperature,
+    thinking: Boolean(options.thinking),
+    messageCount: messages.length,
+    endpoint: chatEndpoint(runtimeSettings),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  console.info(`[${provider}] chat messages preview`, {
+    messages: formatChatMessagesForLog(messages).slice(0, 2000),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  ensureChatSettings(runtimeSettings);
+  console.info(`[${provider}] chat settings validated`, { elapsedMs: elapsedMsSince(startedAt) });
+
   const thinking = Boolean(options.thinking);
+  const responseFormat = jsonResponseFormat(runtimeSettings, schemaName, schema);
+  console.info(`[${provider}] chat response_format built`, {
+    formatType: responseFormat?.type,
+    schemaName: responseFormat && "json_schema" in responseFormat ? responseFormat.json_schema.name : null,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  const processedMessages = withJsonSchemaInstruction(messages, schemaName, schema);
+  console.info(`[${provider}] chat messages processed with schema instruction`, {
+    originalCount: messages.length,
+    processedCount: processedMessages.length,
+    lastMessageChars: processedMessages[processedMessages.length - 1]?.content.length ?? 0,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   const payload: ChatPayload = {
     model: settings.model,
     temperature: settings.temperature,
-    response_format: jsonResponseFormat(),
-    messages: withJsonSchemaInstruction(messages, schemaName, schema),
+    response_format: responseFormat,
+    messages: processedMessages,
     thinking: { type: thinking ? "enabled" : "disabled" }
   };
+
+  console.info(`[${provider}] chat payload ready`, {
+    payloadBytes: JSON.stringify(payload).length,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   const res = await postChat(settings, payload);
+
+  console.info(`[${provider}] chat response received from HTTP`, {
+    status: res.status,
+    ok: res.ok,
+    contentType: res.headers.get("content-type"),
+    contentLength: res.headers.get("content-length"),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   if (!res.ok) {
-    throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
+    const errorBody = await res.text();
+    console.error(`[${provider}] chat HTTP error`, {
+      status: res.status,
+      bodyPreview: preview(errorBody),
+      elapsedMs: elapsedMsSince(startedAt)
+    });
+    throw new Error(`${provider} 请求失败：${res.status} ${errorBody}`);
   }
+
+  console.info(`[${provider}] chat reading response JSON...`, { elapsedMs: elapsedMsSince(startedAt) });
   const data = await res.json();
+
+  console.info(`[${provider}] chat response JSON read`, {
+    hasChoices: !!(data as Record<string, unknown>)?.choices,
+    choiceCount: Array.isArray((data as Record<string, unknown>)?.choices) ? ((data as Record<string, unknown>).choices as unknown[]).length : 0,
+    responseDataBytes: JSON.stringify(data).length,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   const content = extractContent(data);
+  console.info(`[${provider}] chat content extracted`, {
+    contentChars: content.length,
+    contentPreview: preview(content),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   try {
-    return parseJson<T>(content);
-  } catch (error) {
-    console.error("GLM structured output parse failed", {
+    const result = parseJson<T>(content);
+    console.info(`[${provider}] chat JSON parsed successfully`, {
       schemaName,
-      content: preview(content),
-      response: preview(data)
+      contentChars: content.length,
+      resultKeys: typeof result === "object" && result !== null ? Object.keys(result).join(", ") : "non-object",
+      elapsedMs: elapsedMsSince(startedAt)
+    });
+    return result;
+  } catch (error) {
+    console.error(`[${provider}] chat structured output parse failed`, {
+      schemaName,
+      contentChars: content.length,
+      contentPreview: preview(content),
+      responsePreview: preview(data),
+      error: error instanceof Error ? error.message : String(error),
+      elapsedMs: elapsedMsSince(startedAt)
     });
     throw error;
   }
 }
 
 async function chatText(settings: Settings, messages: ChatMessage[]): Promise<string> {
-  ensureChatSettings(settings);
+  const startedAt = Date.now();
+  const runtimeSettings = settings as RuntimeSettings;
+  const provider = providerLabel(runtimeSettings);
+  const model = isPersonalProvider(runtimeSettings) ? runtimeSettings.personalModel : settings.model;
+
+  console.info(`[${provider}] chatText begin`, {
+    model,
+    temperature: settings.temperature,
+    messageCount: messages.length,
+    endpoint: chatEndpoint(runtimeSettings),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  console.info(`[${provider}] chatText messages preview`, {
+    messages: formatChatMessagesForLog(messages).slice(0, 2000),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  ensureChatSettings(runtimeSettings);
+  console.info(`[${provider}] chatText settings validated`, { elapsedMs: elapsedMsSince(startedAt) });
+
   const payload: ChatPayload = {
     model: settings.model,
     temperature: settings.temperature,
     messages,
     thinking: { type: "disabled" }
   };
+
+  console.info(`[${provider}] chatText payload ready`, {
+    payloadBytes: JSON.stringify(payload).length,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   const res = await postChat(settings, payload);
-  if (!res.ok) throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
+
+  console.info(`[${provider}] chatText response received from HTTP`, {
+    status: res.status,
+    ok: res.ok,
+    contentType: res.headers.get("content-type"),
+    contentLength: res.headers.get("content-length"),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  if (!res.ok) {
+    const errorBody = await res.text();
+    console.error(`[${provider}] chatText HTTP error`, {
+      status: res.status,
+      bodyPreview: preview(errorBody),
+      elapsedMs: elapsedMsSince(startedAt)
+    });
+    throw new Error(`${provider} 请求失败：${res.status} ${errorBody}`);
+  }
+
+  console.info(`[${provider}] chatText reading response JSON...`, { elapsedMs: elapsedMsSince(startedAt) });
   const data = await res.json();
+
+  console.info(`[${provider}] chatText response JSON read`, {
+    responseDataBytes: JSON.stringify(data).length,
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   const content = stripThinking(extractContent(data)).trim();
+
+  console.info(`[${provider}] chatText completed`, {
+    contentChars: content.length,
+    contentPreview: preview(content),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
   if (!content) throw new Error("AI 没有返回追问解答");
   return content;
 }
 
 async function chatTextStream(settings: Settings, messages: ChatMessage[], onProgress?: (progress: TextStreamProgress) => void): Promise<string> {
-  ensureChatSettings(settings);
   const startedAt = Date.now();
-  console.info("LLM text stream started", {
-    provider: providerLabel(settings as RuntimeSettings),
-    model: isPersonalProvider(settings as RuntimeSettings) ? settings.personalModel : settings.model,
+  const runtimeSettings = settings as RuntimeSettings;
+  const provider = providerLabel(runtimeSettings);
+  const model = isPersonalProvider(runtimeSettings) ? runtimeSettings.personalModel : settings.model;
+
+  console.info(`[${provider}] chatTextStream begin`, {
+    model,
+    temperature: settings.temperature,
     messageCount: messages.length,
-    prompt: formatChatMessagesForLog(messages)
+    endpoint: chatEndpoint(runtimeSettings),
+    elapsedMs: elapsedMsSince(startedAt)
   });
+
+  console.info(`[${provider}] chatTextStream messages preview`, {
+    messages: formatChatMessagesForLog(messages).slice(0, 2000),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  ensureChatSettings(runtimeSettings);
+  console.info(`[${provider}] chatTextStream settings validated`, { elapsedMs: elapsedMsSince(startedAt) });
+
   const payload: ChatPayload = {
     model: settings.model,
     temperature: settings.temperature,
@@ -888,23 +1182,45 @@ async function chatTextStream(settings: Settings, messages: ChatMessage[], onPro
     thinking: { type: "disabled" },
     stream: true
   };
-  const res = await postChat(settings, payload);
-  console.info("LLM text stream response received", {
-    status: res.status,
-    ok: res.ok,
+
+  console.info(`[${provider}] chatTextStream payload ready`, {
+    payloadBytes: JSON.stringify(payload).length,
     elapsedMs: elapsedMsSince(startedAt)
   });
-  if (!res.ok) throw new Error(`GLM 请求失败：${res.status} ${await res.text()}`);
+
+  const res = await postChat(settings, payload);
+
+  console.info(`[${provider}] chatTextStream response received from HTTP`, {
+    status: res.status,
+    ok: res.ok,
+    contentType: res.headers.get("content-type"),
+    contentLength: res.headers.get("content-length"),
+    elapsedMs: elapsedMsSince(startedAt)
+  });
+
+  if (!res.ok) {
+    const errorBody = await res.text();
+    console.error(`[${provider}] chatTextStream HTTP error`, {
+      status: res.status,
+      bodyPreview: preview(errorBody),
+      elapsedMs: elapsedMsSince(startedAt)
+    });
+    throw new Error(`${provider} 请求失败：${res.status} ${errorBody}`);
+  }
+
+  console.info(`[${provider}] chatTextStream starting to read stream...`, { elapsedMs: elapsedMsSince(startedAt) });
+
   const streamed = await readChatStream(res, (progress) => {
     const content = stripThinking(progress.deltaContent || "");
     if (content || progress.finalTokens !== undefined) {
-      console.info("LLM text stream delta", {
+      console.info(`[${provider}] chatTextStream delta`, {
         deltaChars: content.length,
         generatedChars: progress.generatedChars,
         estimatedTokens: progress.estimatedTokens,
         tokensPerSecond: progress.tokensPerSecond,
         finalTokens: progress.finalTokens,
-        delta: preview(content)
+        delta: preview(content),
+        elapsedMs: elapsedMsSince(startedAt)
       });
     }
     onProgress?.({
@@ -917,58 +1233,75 @@ async function chatTextStream(settings: Settings, messages: ChatMessage[], onPro
       deltaReasoning: progress.deltaReasoning
     });
   });
+
   const content = stripThinking(streamed.content).trim();
-  if (!content) throw new Error("AI 没有返回追问解答");
-  console.info("LLM text stream completed", {
+
+  console.info(`[${provider}] chatTextStream completed`, {
     contentChars: content.length,
     finalTokens: streamed.finalTokens,
     elapsedMs: elapsedMsSince(startedAt),
-    content: preview(content)
+    contentPreview: preview(content)
   });
+
+  if (!content) throw new Error("AI 没有返回追问解答");
   return content;
 }
 
-export async function testConnection(settings: Settings) {
+export async function testConnection(settings: RuntimeSettings) {
   ensureChatSettings(settings);
   const tests: ConnectionTestItem[] = [];
 
+  console.log("[testConnection] Start — model:", settings.model, "provider:", providerLabel(settings));
+
   async function runTest(key: string, label: string, test: () => Promise<string>) {
+    console.log(`[testConnection] Running test: ${label}`);
     try {
       const detail = await test();
       tests.push({ key, label, ok: true, detail });
+      console.log(`[testConnection] ✅ ${label}: ${detail}`);
     } catch (error) {
-      tests.push({ key, label, ok: false, detail: error instanceof Error ? error.message : "测试失败" });
+      const msg = error instanceof Error ? error.message : "测试失败";
+      tests.push({ key, label, ok: false, detail: msg });
+      console.error(`[testConnection] ❌ ${label}: ${msg}`);
     }
   }
 
   await runTest("structured_json", "JSON 模式结构化输出", async () => {
+    console.log("[testConnection][structured_json] Calling chat with JSON schema...");
     const result = await chat<{ ok: boolean }>(settings, [
-      { role: "system", content: "你用于测试 GLM-4.7-Flash 结构化输出连接。请严格返回 JSON。" },
+      { role: "system", content: "你是 AI 模型。请严格按要求的 JSON 格式返回结果，不要输出额外文本。" },
       { role: "user", content: "返回连接状态 ok 为 true。" }
     ], "connection_test", connectionSchema);
+    console.log("[testConnection][structured_json] chat response:", JSON.stringify(result));
     if (result.ok !== true) throw new Error("ok 字段不是 true");
-    return "response_format=json_object 的 JSON 解析成功";
+    return "结构化 JSON 响应与解析成功";
   });
 
   await runTest("structured_thinking", "thinking 结构化输出", async () => {
+    console.log("[testConnection][structured_thinking] Calling chat with thinking enabled...");
     const result = await chat<AssessmentNarrative>(settings, [
       { role: "system", content: "你是一位英语写作测评老师。请按要求返回中文 JSON。" },
       { role: "user", content: "生成一个极短测评摘要：指出时态需要练习，并给 1 条薄弱点和 1 条建议。" }
     ], "assessment_narrative", assessmentNarrativeSchema, { thinking: true });
+    console.log("[testConnection][structured_thinking] chat response keys:", Object.keys(result).join(", "));
     validateAssessmentNarrative(result);
+    console.log("[testConnection][structured_thinking] validation passed");
     return "thinking 请求与结构化字段校验通过";
   });
 
   await runTest("plain_text", "普通文本追问", async () => {
+    console.log("[testConnection][plain_text] Calling chatText...");
     const text = await chatText(settings, [
       { role: "system", content: "你是英语写作教练。回答必须简短。" },
       { role: "user", content: "用中文回答：连接测试正常。" }
     ]);
+    console.log(`[testConnection][plain_text] received ${text.trim().length} chars`);
     if (!text.trim()) throw new Error("普通文本返回为空");
     return `无 response_format 的文本回复可读取，返回 ${text.trim().length} 个字符`;
   });
 
   await runTest("streaming", "流式结构化输出", async () => {
+    console.log("[testConnection][streaming] Building messages and sending streaming request...");
     const messages = withJsonSchemaInstruction(assessmentNarrativeMessages({
       total_questions: 1,
       matrix: DIMENSIONS.map((dimension, index) => ({
@@ -982,29 +1315,37 @@ export async function testConnection(settings: Settings) {
       top_error_tags: [{ tag: "tense_error", count: 1 }],
       top_skill_findings: [{ skill: "过去式不稳定", count: 1 }]
     }), "assessment_narrative", assessmentNarrativeSchema);
+    console.log("[testConnection][streaming] Messages built, calling postChat with stream:true...");
     const response = await postChat(settings, {
       model: settings.model,
       temperature: settings.temperature,
-      response_format: jsonResponseFormat(),
+      response_format: jsonResponseFormat(settings, "assessment_narrative", assessmentNarrativeSchema),
       messages,
       thinking: { type: "enabled" },
       stream: true
     });
+    console.log(`[testConnection][streaming] HTTP response: ${response.status} ${response.ok ? 'OK' : 'FAIL'}`);
     if (!response.ok) throw new Error(`流式请求失败：${response.status} ${await response.text()}`);
+    console.log("[testConnection][streaming] Reading stream...");
     const streamed = await readChatStream(response);
+    console.log(`[testConnection][streaming] Stream done — content: ${streamed.content?.length ?? 0} chars, reasoning: ${streamed.reasoning?.length ?? 0} chars`);
     const content = streamed.content.trim() ? streamed.content : streamed.reasoning;
     const parsed = parseJson<AssessmentNarrative>(content);
+    console.log("[testConnection][streaming] JSON parsed, validating...");
     validateAssessmentNarrative(parsed);
     return "JSON 流解析成功";
   });
 
+  console.log("[testConnection] Summary:", tests.map(t => `${t.label}: ${t.ok ? 'PASS' : 'FAIL'}`).join(", "));
+
   if (tests.some((item) => !item.ok)) {
     const failed = tests.filter((item) => !item.ok).map((item) => `${item.label}：${item.detail}`).join("；");
-    throw Object.assign(new Error(`GLM 连接测试未全部通过：${failed}`), {
+    throw Object.assign(new Error(`${providerLabel(settings as RuntimeSettings)} 连接测试未全部通过：${failed}`), {
       connectionTestResult: { tests } satisfies ConnectionTestResult
     });
   }
 
+  console.log("[testConnection] All tests passed");
   return { tests };
 }
 
@@ -1407,7 +1748,7 @@ ${JSON.stringify(safeOutlines)}
     ], "study_guide", studyGuideSchema, { thinking: true });
     return normalizeStudyGuide(parsed, safeOutlines);
   } catch (error) {
-    console.error("GLM study guide failed, using fallback", error);
+    console.error(`${providerLabel(settings as RuntimeSettings)} study guide failed, using fallback`, error);
     return fallbackStudyGuide(safeOutlines);
   }
 }
@@ -1429,7 +1770,7 @@ export async function generateAssessmentNarrative(
     );
     return normalizeAssessmentNarrative(parsed, payload);
   } catch (error) {
-    console.error("GLM assessment narrative failed, using fallback", error);
+    console.error(`${providerLabel(settings as RuntimeSettings)} assessment narrative failed, using fallback`, error);
     return fallbackAssessmentNarrative(payload);
   }
 }
@@ -1448,7 +1789,7 @@ export async function generateAssessmentNarrativeStream(
   const startedAt = Date.now();
   let lastLogAt = startedAt;
   let pendingStreamLog = "";
-  const logPrefix = "GLM assessment narrative stream";
+  const logPrefix = `${providerLabel(settings as RuntimeSettings)} assessment narrative stream`;
   console.info(`${logPrefix} started`, {
     model: settings.model,
     totalQuestions: payload.total_questions,
@@ -1459,7 +1800,7 @@ export async function generateAssessmentNarrativeStream(
   const res = await postChat(settings, {
     model: settings.model,
     temperature: settings.temperature,
-    response_format: jsonResponseFormat(),
+    response_format: jsonResponseFormat(settings, "assessment_narrative", assessmentNarrativeSchema),
     messages,
     thinking: { type: "enabled" },
     stream: true
@@ -1471,7 +1812,7 @@ export async function generateAssessmentNarrativeStream(
   });
   if (!res.ok) {
     const errorText = await res.text();
-    console.error("GLM streaming narrative failed, using non-stream fallback", {
+    console.error(`${logPrefix} failed, using non-stream fallback`, {
       status: res.status,
       elapsedMs: elapsedMsSince(startedAt),
       errorText
@@ -1515,7 +1856,7 @@ export async function generateAssessmentNarrativeStream(
       });
     }
     if (!narrativeContent.trim()) {
-      console.warn("GLM streaming narrative returned empty content; retrying non-stream thinking request", {
+      console.warn(`${logPrefix} returned empty content; retrying non-stream thinking request`, {
         elapsedMs: elapsedMsSince(startedAt)
       });
       onProgress?.({ generatedChars: 0, estimatedTokens: 0, tokensPerSecond: 0, fallback: true });
@@ -1524,7 +1865,7 @@ export async function generateAssessmentNarrativeStream(
     try {
       return normalizeAssessmentNarrative(parseJson<{ summary?: string; weak_points?: string[]; recommendations?: string[] }>(narrativeContent), payload);
     } catch (parseError) {
-      console.error("GLM streaming narrative parse failed, using non-stream fallback", {
+      console.error(`${logPrefix} parse failed, using non-stream fallback`, {
         elapsedMs: elapsedMsSince(startedAt),
         error: parseError
       });
@@ -1532,7 +1873,7 @@ export async function generateAssessmentNarrativeStream(
       return generateAssessmentNarrative(settings, payload);
     }
   } catch (error) {
-    console.error("GLM streaming narrative failed, using non-stream fallback", {
+    console.error(`${logPrefix} failed, using non-stream fallback`, {
       elapsedMs: elapsedMsSince(startedAt),
       error
     });

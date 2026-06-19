@@ -18,6 +18,7 @@ function normalizeGlobalSettings(settings: Settings & { userId?: number }) {
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
     webLlmModelBaseUrl: (settings.webLlmModelBaseUrl || "https://hf-mirror.com").replace(/\/+$/, ""),
+    personalResponseFormat: "auto" as Settings["personalResponseFormat"],
     hasPersonalApiKey: false,
     userId: settings.userId
   };
@@ -39,6 +40,9 @@ function normalizePersonalSettings(settings: Settings & { personalApiKey?: strin
     personalBaseUrl: settings.personalBaseUrl || "https://api.siliconflow.cn/v1",
     personalModel: settings.personalModel || "deepseek-ai/DeepSeek-V4-Flash",
     webLlmModelBaseUrl: (settings.webLlmModelBaseUrl || "https://hf-mirror.com").replace(/\/+$/, ""),
+    personalResponseFormat: ["auto", "json_object", "json_schema", "none"].includes(String(settings.personalResponseFormat))
+      ? settings.personalResponseFormat as Settings["personalResponseFormat"]
+      : "auto",
     hasPersonalApiKey,
     personalApiKey,
     userId: settings.userId
@@ -62,6 +66,8 @@ export async function POST(request: Request) {
     if (target === "global" && user.role !== "admin") {
       return NextResponse.json({ message: "需要管理员权限。" }, { status: 403 });
     }
+
+
     const current = getRuntimeSettings(user.id);
     const bodyPersonalApiKey = bodyObject.personalApiKey?.trim();
     const merged = {

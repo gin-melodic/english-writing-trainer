@@ -524,6 +524,7 @@ export function getSettings(userId = DEFAULT_USER_ID): Settings {
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,
+    personalResponseFormat: "auto",
     webLlmModelBaseUrl: DEFAULT_WEBLLM_MODEL_BASE_URL,
     hasPersonalApiKey: false
   };
@@ -547,6 +548,9 @@ SELECT key, value FROM user_settings WHERE user_id = ${Number(userId)};
     }
     if (item.key === "personalBaseUrl") defaults.personalBaseUrl = item.value || DEFAULT_PERSONAL_BASE_URL;
     if (item.key === "personalModel") defaults.personalModel = item.value || DEFAULT_PERSONAL_MODEL;
+    if (item.key === "personalResponseFormat" && ["auto", "json_object", "json_schema", "none"].includes(item.value)) {
+      defaults.personalResponseFormat = item.value as Settings["personalResponseFormat"];
+    }
     if (item.key === "webLlmModelBaseUrl") defaults.webLlmModelBaseUrl = item.value || DEFAULT_WEBLLM_MODEL_BASE_URL;
     if (item.key === "personalApiKeyEncrypted") defaults.hasPersonalApiKey = Boolean(item.value);
   }
@@ -604,6 +608,9 @@ export function setSettings(settings: Settings & { personalApiKey?: string; clea
     personalBaseUrl: String(settings.personalBaseUrl || DEFAULT_PERSONAL_BASE_URL).trim() || DEFAULT_PERSONAL_BASE_URL,
     personalModel: String(settings.personalModel || DEFAULT_PERSONAL_MODEL).trim() || DEFAULT_PERSONAL_MODEL,
     webLlmModelBaseUrl: String(settings.webLlmModelBaseUrl || DEFAULT_WEBLLM_MODEL_BASE_URL).trim().replace(/\/+$/, "") || DEFAULT_WEBLLM_MODEL_BASE_URL,
+    personalResponseFormat: ["auto", "json_object", "json_schema", "none"].includes(String(settings.personalResponseFormat))
+      ? settings.personalResponseFormat as Settings["personalResponseFormat"]
+      : current.personalResponseFormat,
     hasPersonalApiKey: current.hasPersonalApiKey
   };
   if (actorRole === "admin") {
@@ -626,7 +633,8 @@ VALUES (${Number(userId)}, 'dailyCount', ${sqlQuote(normalized.dailyCount)});
     ["personalProviderEnabled", normalized.personalProviderEnabled ? "true" : "false"],
     ["personalBaseUrl", normalized.personalBaseUrl],
     ["personalModel", normalized.personalModel],
-    ["webLlmModelBaseUrl", normalized.webLlmModelBaseUrl]
+    ["webLlmModelBaseUrl", normalized.webLlmModelBaseUrl],
+    ["personalResponseFormat", normalized.personalResponseFormat || "auto"]
   ]
     .map(([key, value]) => `(${Number(userId)}, ${sqlQuote(key)}, ${sqlQuote(value)})`)
     .join(",");
@@ -746,6 +754,7 @@ DELETE FROM user_settings WHERE user_id = ${Number(userId)};
     personalProviderEnabled: false,
     personalBaseUrl: DEFAULT_PERSONAL_BASE_URL,
     personalModel: DEFAULT_PERSONAL_MODEL,
+    personalResponseFormat: "auto",
     webLlmModelBaseUrl: DEFAULT_WEBLLM_MODEL_BASE_URL,
     hasPersonalApiKey: false
   }, "admin", userId);

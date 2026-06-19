@@ -27,6 +27,7 @@ export type Settings = {
   personalProviderEnabled: boolean;
   personalBaseUrl: string;
   personalModel: string;
+  personalResponseFormat: "auto" | "json_object" | "json_schema" | "none";
   webLlmModelBaseUrl: string;
   hasPersonalApiKey: boolean;
 };
