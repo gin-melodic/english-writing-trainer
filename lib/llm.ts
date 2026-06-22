@@ -1008,7 +1008,7 @@ async function chat<T>(settings: Settings, messages: ChatMessage[], schemaName: 
   });
 
   const payload: ChatPayload = {
-    model: settings.model,
+    model,
     temperature: settings.temperature,
     response_format: responseFormat,
     messages: processedMessages,
@@ -1102,7 +1102,7 @@ async function chatText(settings: Settings, messages: ChatMessage[]): Promise<st
   console.info(`[${provider}] chatText settings validated`, { elapsedMs: elapsedMsSince(startedAt) });
 
   const payload: ChatPayload = {
-    model: settings.model,
+    model,
     temperature: settings.temperature,
     messages,
     thinking: { type: "disabled" }
@@ -1176,7 +1176,7 @@ async function chatTextStream(settings: Settings, messages: ChatMessage[], onPro
   console.info(`[${provider}] chatTextStream settings validated`, { elapsedMs: elapsedMsSince(startedAt) });
 
   const payload: ChatPayload = {
-    model: settings.model,
+    model,
     temperature: settings.temperature,
     messages,
     thinking: { type: "disabled" },
@@ -1302,6 +1302,7 @@ export async function testConnection(settings: RuntimeSettings) {
 
   await runTest("streaming", "流式结构化输出", async () => {
     console.log("[testConnection][streaming] Building messages and sending streaming request...");
+    const model = isPersonalProvider(settings) ? settings.personalModel : settings.model;
     const messages = withJsonSchemaInstruction(assessmentNarrativeMessages({
       total_questions: 1,
       matrix: DIMENSIONS.map((dimension, index) => ({
@@ -1317,7 +1318,7 @@ export async function testConnection(settings: RuntimeSettings) {
     }), "assessment_narrative", assessmentNarrativeSchema);
     console.log("[testConnection][streaming] Messages built, calling postChat with stream:true...");
     const response = await postChat(settings, {
-      model: settings.model,
+      model,
       temperature: settings.temperature,
       response_format: jsonResponseFormat(settings, "assessment_narrative", assessmentNarrativeSchema),
       messages,
@@ -1785,20 +1786,22 @@ export async function generateAssessmentNarrativeStream(
     return fallbackAssessmentNarrative(payload);
   }
   ensureChatSettings(settings);
+  const runtimeSettings = settings as RuntimeSettings;
+  const model = isPersonalProvider(runtimeSettings) ? runtimeSettings.personalModel : settings.model;
   const messages = withJsonSchemaInstruction(assessmentNarrativeMessages(payload), "assessment_narrative", assessmentNarrativeSchema);
   const startedAt = Date.now();
   let lastLogAt = startedAt;
   let pendingStreamLog = "";
   const logPrefix = `${providerLabel(settings as RuntimeSettings)} assessment narrative stream`;
   console.info(`${logPrefix} started`, {
-    model: settings.model,
+    model,
     totalQuestions: payload.total_questions,
     topErrorTags: payload.top_error_tags.length,
     topSkillFindings: payload.top_skill_findings.length,
     prompt: formatChatMessagesForLog(messages)
   });
   const res = await postChat(settings, {
-    model: settings.model,
+    model,
     temperature: settings.temperature,
     response_format: jsonResponseFormat(settings, "assessment_narrative", assessmentNarrativeSchema),
     messages,
